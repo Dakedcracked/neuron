@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neuron AI — Clinical Workstation Login</title>
+    <meta name="description" content="Neuron AI Diagnostic Platform — Secure Radiologist Login">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: #f5f7fb;
+            color: #0f172a;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* Login card */
+        .login-card {
+            width: 420px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 16px;
+            padding: 40px 36px;
+            box-shadow: 0 16px 32px rgba(15, 23, 42, 0.08);
+            animation: slideUp 0.4s ease both;
+        }
+
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(30px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Logo */
+        .logo-wrap {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 32px;
+        }
+        .logo-icon {
+            width: 44px; height: 44px;
+            border-radius: 12px;
+            background: #2563eb;
+            display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 6px 14px rgba(37, 99, 235, 0.18);
+            flex-shrink: 0;
+        }
+        .logo-icon svg { color: white; width: 24px; height: 24px; }
+        .logo-text h1 {
+            font-size: 18px; font-weight: 800;
+            color: #0f172a;
+            letter-spacing: -0.3px;
+        }
+        .logo-text p {
+            font-size: 10px; color: #6b7280;
+            font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+            margin-top: 2px;
+        }
+
+        /* Heading */
+        .login-heading { margin-bottom: 28px; }
+        .login-heading h2 { font-size: 20px; font-weight: 700; color: #0f172a; }
+        .login-heading p { font-size: 13px; color: #6b7280; margin-top: 4px; }
+
+        /* Form */
+        .form-group { margin-bottom: 18px; }
+        label { display: block; font-size: 11px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+        input[type="text"], input[type="password"] {
+            width: 100%;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: #0f172a;
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            outline: none;
+        }
+        input[type="text"]:focus, input[type="password"]:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+        }
+        input::placeholder { color: #9ca3af; }
+
+        /* Submit button */
+        .btn-login {
+            width: 100%;
+            padding: 14px;
+            background: #2563eb;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px; font-weight: 700;
+            letter-spacing: 0.03em;
+            cursor: pointer;
+            margin-top: 8px;
+            transition: opacity 0.2s, transform 0.2s;
+            box-shadow: 0 6px 14px rgba(37,99,235,0.2);
+            position: relative;
+            overflow: hidden;
+        }
+        .btn-login:hover { opacity: 0.92; transform: translateY(-1px); }
+        .btn-login:active { transform: translateY(0); }
+        .btn-login:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-login .spinner {
+            display: none;
+            width: 16px; height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Error message */
+        .error-msg {
+            display: none;
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 13px;
+            color: #b91c1c;
+            margin-top: 14px;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* Footer note */
+        .security-note {
+            margin-top: 28px;
+            padding-top: 20px;
+            border-top: 1px solid #e5e7eb;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #6b7280;
+            font-size: 11px;
+        }
+        .security-note svg { color: #22c55e; flex-shrink: 0; }
+
+        /* Version badge */
+        .version-badge {
+            position: absolute;
+            top: -12px;
+            right: 20px;
+            background: #e5e7eb;
+            font-size: 9px;
+            font-weight: 700;
+            padding: 3px 10px;
+            border-radius: 99px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #334155;
+        }
+
+        @media (max-width: 520px) {
+            body { padding: 20px; }
+            .login-card { width: 100%; padding: 28px 22px; }
+            .logo-text h1 { font-size: 16px; }
+            .login-heading h2 { font-size: 18px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="version-badge">v2.0 — Secure</div>
+
+        <div class="logo-wrap">
+            <div class="logo-icon">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714a2.25 2.25 0 001.065 1.888l4.149 2.492M14.25 3.104c.251.023.501.05.75.082M19.5 12.75l-3.086 1.85" />
+                </svg>
+            </div>
+            <div class="logo-text">
+                <h1>NEURON AI</h1>
+                <p>Clinical Diagnostic Platform · v2.0</p>
+            </div>
+        </div>
+
+        <div class="login-heading">
+            <h2>Radiologist Sign In</h2>
+            <p>Access your clinical workstation securely</p>
+        </div>
+
+        <form id="login-form" onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" placeholder="e.g. admin" autocomplete="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" placeholder="Enter your password" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn-login" id="login-btn">
+                <span id="login-btn-text">Access Workstation</span>
+                <div class="spinner" id="login-spinner"></div>
+            </button>
+            <div class="error-msg" id="error-msg"></div>
+        </form>
+
+        <div class="security-note">
+            <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.955 11.955 0 003 12c0 6.627 5.373 12 12 12s12-5.373 12-12c0-2.118-.55-4.109-1.513-5.831M12 1.964V12" />
+            </svg>
+            DPDP Act Compliant · SHA-256 Encryption · JWT Sessions (8h)
+        </div>
+    </div>
+
+        <script>
+        // ── Login Handler ──────────────────────────────────────────────────
+        // Auto-redirect if already logged in
+        if (localStorage.getItem('neuron_token')) {
+            window.location.replace('/');
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('login-btn');
+            const btnText = document.getElementById('login-btn-text');
+            const spinner = document.getElementById('login-spinner');
+            const errorEl = document.getElementById('error-msg');
+
+            btn.disabled = true;
+            btnText.style.display = 'none';
+            spinner.style.display = 'block';
+            errorEl.style.display = 'none';
+
+            const formData = new FormData(e.target);
+
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.detail || 'Authentication failed.');
+                }
+                localStorage.setItem('neuron_token', data.access_token);
+                localStorage.setItem('neuron_username', data.username);
+                localStorage.setItem('neuron_role', data.role);
+                window.location.replace('/');
+            } catch (err) {
+                errorEl.textContent = err.message;
+                errorEl.style.display = 'block';
+                btn.disabled = false;
+                btnText.style.display = 'block';
+                spinner.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>

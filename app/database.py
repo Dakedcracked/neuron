@@ -1,0 +1,196 @@
+import os
+import uuid
+from datetime import datetime, timezone
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, func
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+DATABASE_URL = "sqlite:///neuron_clinic.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+# ── ORM Models ────────────────────────────────────────────────────────────────
+
+class Scan(Base):
+    __tablename__ = "scans"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    patient_hash = Column(String, nullable=False, index=True)
+    scan_type = Column(String, nullable=False)             # XRAY, CT, MRI
+    pathology_detected = Column(String, nullable=False)
+    confidence_score = Column(Float, nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    inference_latency = Column(Float, default=0.0)         # Latency in ms
+    pytorch_executed = Column(String, default="false")
+
+
+class ClinicSettings(Base):
+    __tablename__ = "clinic_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+    _seed_default_settings()
+
+
+def _seed_default_settings():
+    db = SessionLocal()
+    try:
+      defaults = {
+          "clinic_name": "Neuron AI Diagnostic Centre",
+          "station_id": "B2B-HYD-94",
+      }
+      for key, value in defaults.items():
+          existing = db.query(ClinicSettings).filter_by(key=key).first()
+          if not existing:
+              db.add(ClinicSettings(key=key, value=value))
+      db.commit()
+    finally:
+      db.close()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ── Write Operations ──────────────────────────────────────────────────────────
+
+def log_scan(
+    db, patient_hash: str, scan_type: str, pathology_detected: str,
+    confidence_score: float, inference_latency: float, pytorch_executed: bool = False
+):
+    """
+    Saves a diagnostic scan record with latency telemetry for SOTA model evaluation.
+    """
+    scan = Scan(
+        patient_hash=patient_hash,
+        scan_type=scan_type,
+        pathology_detected=pathology_detected,
+        confidence_score=confidence_score,
+        inference_latency=inference_latency,
+        timestamp=datetime.now(timezone.utc),
+        pytorch_executed=str(pytorch_executed).lower(),
+    )
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+    return scan
+
+
+def update_clinic_setting(db, key: str, value: str):
+    setting = db.query(ClinicSettings).filter_by(key=key).first()
+    if setting:
+        setting.value = value
+        db.commit()
+    else:
+        db.add(ClinicSettings(key=key, value=value))
+        db.commit()
+
+
+def get_clinic_settings(db) -> dict:
+    rows = db.query(ClinicSettings).all()
+    return {r.key: r.value for r in rows}
+
+
+# ── Read Operations ───────────────────────────────────────────────────────────
+
+def get_scan_history(db, page: int = 1, page_size: int = 20, scan_type: str = None, pathology: str = None):
+    """Paginated scan history with latency statistics for accuracy auditing."""
+    query = db.query(Scan).order_by(Scan.timestamp.desc())
+    if scan_type:
+        query = query.filter(Scan.scan_type == scan_type.upper())
+    if pathology:
+        query = query.filter(Scan.pathology_detected.ilike(f"%{pathology}%"))
+
+    total = query.count()
+    scans = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+        "scans": [
+            {
+                "id": s.id,
+                "patient_hash": s.patient_hash,
+                "scan_type": s.scan_type,
+                "pathology_detected": s.pathology_detected,
+                "confidence_score": s.confidence_score,
+                "timestamp": s.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "inference_latency": s.inference_latency,
+                "pytorch_executed": s.pytorch_executed,
+            }
+            for s in scans
+        ],
+    }
+
+
+def get_dashboard_metrics(db):
+    total_scans = db.query(func.count(Scan.id)).scalar() or 0
+
+    # Scan counts per modality
+    modality_counts = db.query(Scan.scan_type, func.count(Scan.id)).group_by(Scan.scan_type).all()
+    modality_map = {row[0]: row[1] for row in modality_counts}
+
+    # Average latency per modality for model optimization audits
+    modality_latencies = db.query(Scan.scan_type, func.avg(Scan.inference_latency)).group_by(Scan.scan_type).all()
+    modality_latency_map = {row[0]: round(float(row[1]), 2) if row[1] is not None else 0.0 for row in modality_latencies}
+
+    # Pathology counts
+    pathology_counts = db.query(Scan.pathology_detected, func.count(Scan.id)).group_by(Scan.pathology_detected).all()
+    pathology_map = {row[0]: row[1] for row in pathology_counts}
+
+    # Compute Positive rate (abnormals / eligible)
+    eligible_scans = db.query(func.count(Scan.id)).filter(Scan.pathology_detected != "Inconclusive").scalar() or 0
+    abnormal_count = db.query(func.count(Scan.id)).filter(
+        Scan.pathology_detected != "Normal",
+        Scan.pathology_detected != "Inconclusive",
+    ).scalar() or 0
+    positive_rate = round((abnormal_count / eligible_scans * 100), 1) if eligible_scans > 0 else 0.0
+
+    recent_scans = db.query(Scan).order_by(Scan.timestamp.desc()).limit(10).all()
+    recent_list = [
+        {
+            "id": r.id,
+            "patient_hash": r.patient_hash,
+            "scan_type": r.scan_type,
+            "pathology_detected": r.pathology_detected,
+            "confidence_score": r.confidence_score,
+            "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "inference_latency": r.inference_latency,
+            "pytorch_executed": r.pytorch_executed,
+        }
+        for r in recent_scans
+    ]
+
+    settings = get_clinic_settings(db)
+
+    return {
+        "total_scans": total_scans,
+        "positive_rate": positive_rate,
+        "modality_counts": {
+            "XRAY": modality_map.get("XRAY", 0),
+            "CT": modality_map.get("CT", 0),
+            "MRI": modality_map.get("MRI", 0),
+        },
+        "modality_latencies": {
+            "XRAY": modality_latency_map.get("XRAY", 0.0),
+            "CT": modality_latency_map.get("CT", 0.0),
+            "MRI": modality_latency_map.get("MRI", 0.0),
+        },
+        "pathology_counts": pathology_map,
+        "recent_scans": recent_list,
+        "settings": settings,
+    }
