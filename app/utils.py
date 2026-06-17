@@ -369,3 +369,43 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
             "img_base64": img_base64,
             "metadata": {"age": "N/A", "sex": "N/A", "description": "Standard Medical Image Ingest"},
         }
+
+
+def preprocess_for_medsam(image_array: np.ndarray) -> np.ndarray:
+    """
+    Preprocesses a 2D single-channel or 3-channel image array to form a 1024x1024 input tensor
+    conforming to MedSAM's image encoder expectations.
+    Normalizes with standard SAM mean=[123.675, 116.28, 103.53] and std=[58.395, 57.12, 57.375].
+    Returns:
+        np.ndarray: shape (1, 3, 1024, 1024)
+    """
+    if len(image_array.shape) == 3:
+        if image_array.shape[0] == 3:
+            image_array = np.transpose(image_array, (1, 2, 0))
+        if len(image_array.shape) == 3 and image_array.shape[2] > 3:
+            mid_z = image_array.shape[2] // 2
+            image_array = image_array[:, :, mid_z]
+            
+    img_min, img_max = image_array.min(), image_array.max()
+    if img_max - img_min > 0:
+        img_255 = (image_array - img_min) / (img_max - img_min) * 255.0
+    else:
+        img_255 = np.zeros_like(image_array)
+        
+    if len(img_255.shape) == 2:
+        img_rgb = np.stack([img_255, img_255, img_255], axis=-1)
+    elif len(img_255.shape) == 3 and img_255.shape[2] == 1:
+        img_rgb = np.concatenate([img_255, img_255, img_255], axis=-1)
+    else:
+        img_rgb = img_255
+        
+    from PIL import Image as PILImage
+    img_pil = PILImage.fromarray(img_rgb.astype(np.uint8))
+    img_resized = img_pil.resize((1024, 1024), PILImage.Resampling.BILINEAR)
+    img_resized_np = np.array(img_resized).astype(np.float32)
+    
+    mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+    normalized = (img_resized_np - mean) / std
+    
+    return np.transpose(normalized, (2, 0, 1))[np.newaxis, ...]

@@ -75,6 +75,82 @@ while IFS= read -r line || [ -n "$line" ]; do
     fi
 done < .env
 
+# 7.5. Run Pre-flight Diagnostics
+echo "🔍 Running pre-flight diagnostics..."
+
+# Check CUDA capabilities
+python3 -c "
+import torch
+print(f'   - PyTorch version: {torch.__version__}')
+cuda_avail = torch.cuda.is_available()
+print(f'   - CUDA available: {cuda_avail}')
+if cuda_avail:
+    print(f'   - GPU device: {torch.cuda.get_device_name(0)}')
+    print(f'   - CUDA Device count: {torch.cuda.device_count()}')
+else:
+    print('   - Running in CPU-only fallback mode. Heavy neural model inference may be slower.')
+"
+
+# Check foundation weights files existence
+echo "🔍 Verifying foundation model weights in 'models/'..."
+if [ ! -f "models/densenet121_radimagenet.pt" ]; then
+    echo "   ⚠ Warning: models/densenet121_radimagenet.pt is missing. Folds will degrade gracefully using densenet121_xrv.pt."
+else
+    echo "   ✓ models/densenet121_radimagenet.pt is present."
+fi
+if [ ! -f "models/resnet50_radimagenet.pt" ]; then
+    echo "   ⚠ Warning: models/resnet50_radimagenet.pt is missing. Folds will degrade gracefully using resnet50_clinical.pt."
+else
+    echo "   ✓ models/resnet50_radimagenet.pt is present."
+fi
+if [ ! -f "models/medsam.onnx" ]; then
+    echo "   ⚠ Warning: models/medsam.onnx is missing. MedSAM will degrade to MONAI SegResNet or simulated overlays."
+else
+    echo "   ✓ models/medsam.onnx is present."
+fi
+
+# Check Postgres and Redis connections
+python3 -c "
+import os
+import sys
+
+# Test PostgreSQL connection
+db_url = os.environ.get('DATABASE_URL')
+if db_url:
+    try:
+        import urllib.parse as urlparse
+        # Extract connection properties
+        url = urlparse.urlparse(db_url)
+        import psycopg2
+        conn = psycopg2.connect(
+            database=url.path[1:],
+            user=url.username,
+            password=url.password,
+            host=url.hostname,
+            port=url.port
+        )
+        conn.close()
+        print('   - PostgreSQL database connection successful.')
+    except Exception as e:
+        print(f'   - ⚠ PostgreSQL connection failed: {e}')
+else:
+    print('   - ⚠ DATABASE_URL is not set in env.')
+
+# Test Redis connection
+redis_url = os.environ.get('REDIS_URL')
+if redis_url:
+    try:
+        import redis
+        r = redis.Redis.from_url(redis_url)
+        r.ping()
+        print('   - Redis connection successful.')
+    except Exception as e:
+        print(f'   - ⚠ Redis connection failed: {e}')
+else:
+    print('   - ⚠ REDIS_URL is not set in env.')
+"
+echo "✓ Pre-flight diagnostics complete."
+
 # 7. Start Celery worker in the background
 echo "🐝 Starting Celery background worker..."
 celery -A app.worker.celery_app worker --loglevel=info --pool=solo > celery.log 2>&1 &
