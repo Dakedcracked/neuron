@@ -31,11 +31,12 @@ async def lifespan(app: FastAPI):
     from app.database import engine, Base
     Base.metadata.create_all(bind=engine)
     init_db()
-    db = AuthSession()
-    try:
+    with AuthSession() as db:
         seed_default_admin(db)
-    finally:
-        db.close()
+    
+    from app.utils import ensure_bucket_lifecycle_policy
+    ensure_bucket_lifecycle_policy()
+
     print("✓ Neuron AI Clinical Platform ready.")
     yield
     print("Neuron AI shutting down.")
@@ -95,8 +96,7 @@ async def models_page(request: Request):
 @limiter.limit("50/minute")
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
     """Validates credentials and returns JWT access token."""
-    db = AuthSession()
-    try:
+    with AuthSession() as db:
         user = db.query(User).filter(User.username == username).first()
         if not user or not verify_password(password, user.hashed_password) or not user.is_active:
             raise HTTPException(status_code=401, detail="Invalid username or password.")
@@ -107,8 +107,6 @@ async def login(request: Request, username: str = Form(...), password: str = For
             "username": user.username,
             "role": user.role,
         }
-    finally:
-        db.close()
 
 
 @app.get("/api/auth/me")
@@ -123,8 +121,7 @@ async def change_password(
     new_password: str = Form(...),
     current_user: User = Depends(get_current_user),
 ):
-    db = AuthSession()
-    try:
+    with AuthSession() as db:
         user = db.query(User).filter(User.username == current_user.username).first()
         if not verify_password(old_password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Current password is incorrect.")
@@ -133,8 +130,6 @@ async def change_password(
         user.hashed_password = hash_password(new_password)
         db.commit()
         return {"status": "success", "message": "Password updated successfully."}
-    finally:
-        db.close()
 
 
 # ── Scaling Optimized S3/R2 Direct Uploads ────────────────────────────────────

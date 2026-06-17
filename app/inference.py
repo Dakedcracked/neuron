@@ -13,6 +13,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+try:
+    import tritonclient.http as tritonhttp
+except ImportError:
+    tritonhttp = None
+
 # ── Model Loading ─────────────────────────────────────────────────────────────
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,6 +80,8 @@ try:
     if not hasattr(xrv_model, "pathologies"):
         xrv_model.pathologies = getattr(xrv.datasets, "default_pathologies", [])
     xrv_model.to(DEVICE)
+    if DEVICE.type == "cuda":
+        xrv_model = xrv_model.half()
     xrv_model.eval()
     XRV_AVAILABLE = True
 except Exception as e:
@@ -101,6 +108,8 @@ try:
         # Replace final FC layer for our class count
         net.fc = nn.Linear(net.fc.in_features, num_classes)
         net.to(DEVICE)
+        if DEVICE.type == "cuda":
+            net = net.half()
         net.eval()
         return net, origin
 
@@ -225,6 +234,59 @@ def _volume_transform_3d(file_path: str) -> torch.Tensor:
         return torch.randn(1, 1, 96, 96, 96)
 
 
+# ── Decoupled Raw Neural Network Execution & Triton Routing ───────────────────
+
+def _execute_triton_inference(np_arr: np.ndarray, model_name: str, input_name: str = "input", output_name: str = "output") -> np.ndarray:
+    """
+    Executes a model prediction on a downstream Triton Inference Server.
+    Converts normalized NumPy input arrays directly into triton payloads.
+    """
+    if tritonhttp is None:
+        raise RuntimeError("tritonclient.http package is not installed.")
+        
+    triton_url = os.environ.get("TRITON_SERVER_URL")
+    if not triton_url:
+        raise RuntimeError("TRITON_SERVER_URL is not set.")
+        
+    # Clean the URL to extract host and port
+    url_clean = triton_url.replace("http://", "").replace("https://", "")
+    client = tritonhttp.InferenceServerClient(url=url_clean)
+    
+    # Select datatype matching array precision
+    datatype = "FP16" if np_arr.dtype == np.float16 else "FP32"
+    
+    infer_input = tritonhttp.InferInput(input_name, np_arr.shape, datatype)
+    infer_input.set_data_from_numpy(np_arr)
+    
+    infer_output = tritonhttp.InferRequestedOutput(output_name)
+    response = client.infer(model_name=model_name, inputs=[infer_input], outputs=[infer_output])
+    return response.as_numpy(output_name)
+
+
+def _local_nn_forward_xray(tensor: torch.Tensor) -> torch.Tensor:
+    """Runs local in-process DenseNet121 model execution (FP16 if CUDA active)."""
+    with torch.inference_mode():
+        if DEVICE.type == "cuda":
+            tensor = tensor.half()
+        return xrv_model(tensor)
+
+
+def _local_nn_forward_resnet(model: torch.nn.Module, tensor: torch.Tensor) -> torch.Tensor:
+    """Runs local in-process ResNet-50 model execution (FP16 if CUDA active)."""
+    with torch.inference_mode():
+        if DEVICE.type == "cuda":
+            tensor = tensor.half()
+        return model(tensor)
+
+
+def _local_nn_forward_segresnet(tensor: torch.Tensor) -> np.ndarray:
+    """Runs local in-process SegResNet model execution using ONNX Runtime."""
+    # ONNX expects float32 NumPy array input
+    np_arr = tensor.cpu().numpy().astype(np.float32)
+    ort_inputs = {"input": np_arr}
+    return segresnet_session.run(["output"], ort_inputs)[0]
+
+
 # ── Main Inference Entry Point ────────────────────────────────────────────────
 
 def extract_bboxes_from_mask(mask_3d: np.ndarray, threshold=0.5):
@@ -280,25 +342,31 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
     Runs AI inference on a medical scan file.
     - Router: Attempts to call the standalone Inference Server (dynamic batching) first.
     - Fallback: Runs local in-process inference if the server is unreachable.
+    - Triton: Bypasses local in-process forward passes if downstream Triton server is configured.
     """
     import urllib.request
     import urllib.parse
     import json
     
-    server_url = os.environ.get("NEURON_INFERENCE_SERVER_URL", "http://127.0.0.1:8001/predict")
-    try:
-        post_data = urllib.parse.urlencode({
-            "file_path": file_path,
-            "modality": modality,
-            "patient_hash": patient_hash
-        }).encode('utf-8')
-        req = urllib.request.Request(server_url, data=post_data, method="POST")
-        # Set short timeout to quickly trigger local fallback if server is down
-        with urllib.request.urlopen(req, timeout=10.0) as response:
-            res_body = response.read().decode('utf-8')
-            return json.loads(res_body)
-    except Exception as e:
-        print(f"⚠ [Router] Inference Server unreachable at {server_url} ({e}). Falling back to local in-process execution.")
+    # Check if standalone dynamic batching Inference Server is configured and preferred
+    triton_url = os.environ.get("TRITON_SERVER_URL")
+    
+    # If Triton is NOT set, we try the custom dynamic batching server first
+    if not triton_url:
+        server_url = os.environ.get("NEURON_INFERENCE_SERVER_URL", "http://127.0.0.1:8001/predict")
+        try:
+            post_data = urllib.parse.urlencode({
+                "file_path": file_path,
+                "modality": modality,
+                "patient_hash": patient_hash
+            }).encode('utf-8')
+            req = urllib.request.Request(server_url, data=post_data, method="POST")
+            # Set short timeout to quickly trigger local fallback if server is down
+            with urllib.request.urlopen(req, timeout=10.0) as response:
+                res_body = response.read().decode('utf-8')
+                return json.loads(res_body)
+        except Exception as e:
+            print(f"⚠ [Router] Inference Server unreachable at {server_url} ({e}). Falling back to local/Triton in-process execution.")
 
     pytorch_success = False
     model_info = f"{INCONCLUSIVE_LABEL} (no validated model available)"
@@ -308,15 +376,32 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
         pathologies = ["Pneumonia", "Cardiomegaly", "Pleural Effusion", "Pneumothorax",
                        "Atelectasis", "Consolidation", "Edema", "Mass", "Nodule", "Normal"]
 
-        if XRV_AVAILABLE:
+        if XRV_AVAILABLE or triton_url:
             try:
                 tensor = _xray_transform(file_path).to(DEVICE)
-                with torch.inference_mode():
-                    xrv_out = xrv_model(tensor)  # shape: [1, 18]
+                
+                if triton_url and tritonhttp is not None:
+                    # Triton client path
+                    model_name = os.environ.get("TRITON_MODEL_XRAY", "densenet121_xrv")
+                    # Convert tensor to NumPy array matching precision of target execution
+                    np_arr = tensor.cpu().numpy()
+                    if DEVICE.type == "cuda":
+                        np_arr = np_arr.astype(np.float16)
+                    else:
+                        np_arr = np_arr.astype(np.float32)
+                    
+                    xrv_out_np = _execute_triton_inference(np_arr, model_name)
+                    xrv_out = torch.tensor(xrv_out_np).to(DEVICE)
+                    model_info = f"Triton Server: {model_name} (FP16)" if DEVICE.type == "cuda" else f"Triton Server: {model_name}"
+                else:
+                    # Local path using the extracted forward helper
+                    xrv_out = _local_nn_forward_xray(tensor)
+                    model_info = "torchxrayvision DenseNet121 (local FP16)" if DEVICE.type == "cuda" else "torchxrayvision DenseNet121"
+                
                 probs_raw = torch.sigmoid(xrv_out[0]).cpu().numpy()
 
                 # Map XRV labels to our pathology set
-                xrv_labels = xrv_model.pathologies
+                xrv_labels = xrv_model.pathologies if xrv_model is not None else getattr(xrv.datasets, "default_pathologies", [])
                 label_map = {
                     "Pneumonia":       ["Pneumonia"],
                     "Cardiomegaly":    ["Cardiomegaly"],
@@ -349,18 +434,17 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "torchxrayvision DenseNet121 (local or upstream weights)"
-                print(f"✓ torchxrayvision inference: {pathology} ({confidence:.2%})")
+                print(f"✓ X-Ray inference: {pathology} ({confidence:.2%}) using {model_info}")
 
             except Exception as e:
-                print(f"⚠ torchxrayvision inference failed, using fallback: {e}")
+                print(f"⚠ X-Ray inference failed, using fallback: {e}")
                 pred_map = None
 
         if not pytorch_success:
             pred_map = {INCONCLUSIVE_LABEL: 1.0}
             pathology = INCONCLUSIVE_LABEL
             confidence = 0.0
-            model_info = f"{INCONCLUSIVE_LABEL} (torchxrayvision unavailable)"
+            model_info = f"{INCONCLUSIVE_LABEL} (X-Ray model execution failed)"
 
         if pathology in ("Normal", INCONCLUSIVE_LABEL):
             bbox = None
@@ -380,12 +464,19 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
         pathologies = ["Renal Calculi", "Hepatic Lesion", "Appendicitis", "Normal"]
 
         bbox = None
-        if UNET_AVAILABLE and segresnet_session is not None:
+        if (UNET_AVAILABLE and segresnet_session is not None) or triton_url:
             try:
                 tensor = _volume_transform_3d(file_path)
                 tensor = tensor.repeat(1, 4, 1, 1, 1) # Expand to 4 channels
-                ort_inputs = {"input": tensor.numpy().astype(np.float32)}
-                logits = segresnet_session.run(["output"], ort_inputs)[0] # [1, 3, 96, 96, 96]
+                
+                if triton_url and tritonhttp is not None:
+                    model_name = os.environ.get("TRITON_MODEL_MRI_3D", "segresnet_mri")
+                    np_arr = tensor.numpy().astype(np.float32)
+                    logits = _execute_triton_inference(np_arr, model_name)
+                    model_info = f"Triton Server: {model_name}"
+                else:
+                    logits = _local_nn_forward_segresnet(tensor)
+                    model_info = "MONAI SegResNet (ONNX Local)"
                 
                 probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
                 tumor_mask = probs[0, 1] # Tumor core channel
@@ -399,17 +490,29 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "MONAI SegResNet (ONNX Edge Optimized)"
-                print(f"✓ SegResNet CT inference: {pathology} ({confidence:.2%})")
+                print(f"✓ SegResNet CT inference: {pathology} ({confidence:.2%}) using {model_info}")
             except Exception as e:
                 print(f"⚠ CT SegResNet inference failed, using ResNet/fallback: {e}")
 
-        if not pytorch_success and RESNET_AVAILABLE:
+        if not pytorch_success and (RESNET_AVAILABLE or triton_url):
             try:
                 tensor = _volume_transform(file_path).to(DEVICE)
-                with torch.inference_mode():
-                    logits = ct_model(tensor)  # [1, 4]
-                    raw_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                
+                if triton_url and tritonhttp is not None:
+                    model_name = os.environ.get("TRITON_MODEL_CT", "resnet50_ct")
+                    np_arr = tensor.cpu().numpy()
+                    if DEVICE.type == "cuda":
+                        np_arr = np_arr.astype(np.float16)
+                    else:
+                        np_arr = np_arr.astype(np.float32)
+                    logits_np = _execute_triton_inference(np_arr, model_name)
+                    logits = torch.tensor(logits_np).to(DEVICE)
+                    model_info = f"Triton Server: {model_name} (FP16)" if DEVICE.type == "cuda" else f"Triton Server: {model_name}"
+                else:
+                    logits = _local_nn_forward_resnet(ct_model, tensor)
+                    model_info = "ResNet-50 (local FP16)" if DEVICE.type == "cuda" else "ResNet-50 (local)"
+                
+                raw_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 pred_map = dict(zip(pathologies, raw_probs.tolist()))
                 # ResNet is ImageNet pretrained — we add clinical-realistic prior shift
                 clinical_prior = np.array([0.35, 0.30, 0.20, 0.15])
@@ -419,8 +522,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "ResNet-50 clinical weights" if RESNET_CLINICAL else "ResNet-50 ImageNet (demo mode)"
-                print(f"✓ ResNet-50 CT inference: {pathology} ({confidence:.2%})")
+                print(f"✓ ResNet-50 CT inference: {pathology} ({confidence:.2%}) using {model_info}")
             except Exception as e:
                 print(f"⚠ CT ResNet inference failed, using fallback: {e}")
 
@@ -428,7 +530,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
             pred_map = {INCONCLUSIVE_LABEL: 1.0}
             pathology = INCONCLUSIVE_LABEL
             confidence = 0.0
-            model_info = f"{INCONCLUSIVE_LABEL} (CT clinical model missing)"
+            model_info = f"{INCONCLUSIVE_LABEL} (CT model execution failed)"
 
         bbox_map = {
             "Renal Calculi":  {"x": 32, "y": 44, "w": 12, "h": 12, "label": "Renal Calculi (R)"},
@@ -443,12 +545,19 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
         pathologies = ["Glioblastoma", "Meningioma", "Ischemic Stroke", "Normal"]
 
         bbox = None
-        if UNET_AVAILABLE and segresnet_session is not None:
+        if (UNET_AVAILABLE and segresnet_session is not None) or triton_url:
             try:
                 tensor = _volume_transform_3d(file_path)
                 tensor = tensor.repeat(1, 4, 1, 1, 1) # Expand to 4 channels
-                ort_inputs = {"input": tensor.numpy().astype(np.float32)}
-                logits = segresnet_session.run(["output"], ort_inputs)[0] # [1, 3, 96, 96, 96]
+                
+                if triton_url and tritonhttp is not None:
+                    model_name = os.environ.get("TRITON_MODEL_MRI_3D", "segresnet_mri")
+                    np_arr = tensor.numpy().astype(np.float32)
+                    logits = _execute_triton_inference(np_arr, model_name)
+                    model_info = f"Triton Server: {model_name}"
+                else:
+                    logits = _local_nn_forward_segresnet(tensor)
+                    model_info = "MONAI SegResNet (ONNX Local)"
                 
                 probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
                 tumor_mask = probs[0, 1] # Tumor core channel
@@ -462,17 +571,29 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "MONAI SegResNet (ONNX Edge Optimized)"
-                print(f"✓ SegResNet MRI inference: {pathology} ({confidence:.2%})")
+                print(f"✓ SegResNet MRI inference: {pathology} ({confidence:.2%}) using {model_info}")
             except Exception as e:
                 print(f"⚠ MRI SegResNet inference failed, using ResNet/fallback: {e}")
 
-        if not pytorch_success and RESNET_AVAILABLE:
+        if not pytorch_success and (RESNET_AVAILABLE or triton_url):
             try:
                 tensor = _volume_transform(file_path).to(DEVICE)
-                with torch.inference_mode():
-                    logits = mri_model(tensor)  # [1, 4]
-                    raw_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                
+                if triton_url and tritonhttp is not None:
+                    model_name = os.environ.get("TRITON_MODEL_MRI", "resnet50_mri")
+                    np_arr = tensor.cpu().numpy()
+                    if DEVICE.type == "cuda":
+                        np_arr = np_arr.astype(np.float16)
+                    else:
+                        np_arr = np_arr.astype(np.float32)
+                    logits_np = _execute_triton_inference(np_arr, model_name)
+                    logits = torch.tensor(logits_np).to(DEVICE)
+                    model_info = f"Triton Server: {model_name} (FP16)" if DEVICE.type == "cuda" else f"Triton Server: {model_name}"
+                else:
+                    logits = _local_nn_forward_resnet(mri_model, tensor)
+                    model_info = "ResNet-50 (local FP16)" if DEVICE.type == "cuda" else "ResNet-50 (local)"
+                
+                raw_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 pred_map = dict(zip(pathologies, raw_probs.tolist()))
                 clinical_prior = np.array([0.40, 0.25, 0.20, 0.15])
                 blended = (np.array(list(pred_map.values())) * 0.3 + clinical_prior * 0.7)
@@ -481,8 +602,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "ResNet-50 clinical weights" if RESNET_CLINICAL else "ResNet-50 ImageNet (demo mode)"
-                print(f"✓ ResNet-50 MRI inference: {pathology} ({confidence:.2%})")
+                print(f"✓ ResNet-50 MRI inference: {pathology} ({confidence:.2%}) using {model_info}")
             except Exception as e:
                 print(f"⚠ MRI ResNet inference failed, using fallback: {e}")
 
@@ -490,7 +610,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
             pred_map = {INCONCLUSIVE_LABEL: 1.0}
             pathology = INCONCLUSIVE_LABEL
             confidence = 0.0
-            model_info = f"{INCONCLUSIVE_LABEL} (MRI clinical model missing)"
+            model_info = f"{INCONCLUSIVE_LABEL} (MRI model execution failed)"
 
         bbox_map = {
             "Glioblastoma":   {"x": 38, "y": 32, "w": 24, "h": 24, "label": "High-Grade Glioma"},

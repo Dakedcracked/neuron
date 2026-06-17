@@ -1,5 +1,4 @@
 import hashlib
-import os
 import io
 import base64
 import numpy as np
@@ -7,64 +6,48 @@ import pydicom
 import nibabel as nib
 from PIL import Image
 import torch
-
 import boto3
-from botocore.exceptions import NoCredentialsError
+from app.config import (
+    NEURON_CLINIC_SALT,
+    AWS_ACCESS_KEY_ID,
+    AWS_SECRET_ACCESS_KEY,
+    S3_BUCKET_NAME,
+    S3_ENDPOINT_URL,
+    S3_REGION,
+    S3_PUBLIC_URL_PREFIX
+)
 
-CLINIC_SALT = os.environ.get("NEURON_CLINIC_SALT")
-if not CLINIC_SALT:
-    print("⚠️ WARNING: NEURON_CLINIC_SALT is not set. Falling back to an insecure default salt. Patient hashes may not be consistent across environments.")
-    CLINIC_SALT = "neuron_secure_salt_2026_fallback"
+CLINIC_SALT = NEURON_CLINIC_SALT
+S3_BUCKET = S3_BUCKET_NAME
 
-S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "neuron-clinical-scans")
-S3_REGION = os.environ.get("S3_REGION", "ap-south-1")
+
+def get_s3_client():
+    """Initializes and returns a boto3 S3 client configured for R2 object storage."""
+    return boto3.client(
+        's3',
+        endpoint_url=S3_ENDPOINT_URL,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=S3_REGION
+    )
 
 
 def upload_to_s3(file_content: bytes, filename: str) -> str:
     """
-    Uploads the raw DICOM/NIfTI file to AWS S3 / Cloudflare R2.
-    Returns the public/presigned URL.
+    Streams raw scan bytes directly to Cloudflare R2 / AWS S3 using upload_fileobj.
+    Bypasses local file caching completely to ensure cost-efficiency and performance.
     """
-    # For MVP local development, we mock S3 unless credentials are explicitly provided
-    if os.environ.get("MOCK_S3", "true").lower() == "true":
-        mock_bucket = os.path.join(os.getcwd(), "mock_s3_bucket")
-        os.makedirs(mock_bucket, exist_ok=True)
-        local_path = os.path.join(mock_bucket, filename)
-        with open(local_path, "wb") as f:
-            f.write(file_content)
-        return f"s3://{S3_BUCKET}/mock/{filename}"
-        
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-        region_name=S3_REGION
-    )
-    try:
-        s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_content)
-        return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{filename}"
-    except NoCredentialsError:
-        print("⚠ AWS Credentials not available. Skipping S3 upload.")
-        return f"s3://{S3_BUCKET}/failed_upload/{filename}"
+    s3_client = get_s3_client()
+    fileobj = io.BytesIO(file_content)
+    s3_client.upload_fileobj(fileobj, S3_BUCKET, filename)
+    return f"{S3_PUBLIC_URL_PREFIX}/{filename}"
 
 
 def generate_presigned_upload_url(filename: str, expiration=3600) -> dict:
     """
-    Generates a presigned URL/POST payload to upload a file directly to S3.
+    Generates a secure presigned POST payload for direct browser-to-R2 uploads.
     """
-    if os.environ.get("MOCK_S3", "true").lower() == "true":
-        return {
-            "url": "http://127.0.0.1:8000/api/mock-upload",
-            "fields": {"key": filename},
-            "mock": True
-        }
-        
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-        region_name=S3_REGION
-    )
+    s3_client = get_s3_client()
     try:
         response = s3_client.generate_presigned_post(
             Bucket=S3_BUCKET,
@@ -73,8 +56,34 @@ def generate_presigned_upload_url(filename: str, expiration=3600) -> dict:
         )
         return response
     except Exception as e:
-        print(f"Error generating presigned post URL: {e}")
+        print(f"❌ Error generating presigned post URL: {e}")
         return {}
+
+
+def ensure_bucket_lifecycle_policy():
+    """
+    Applies a strict 30-day lifecycle expiration policy to the S3/R2 bucket
+    to guarantee DPDP storage compliance and minimize storage overhead costs.
+    """
+    s3_client = get_s3_client()
+    lifecycle_policy = {
+        'Rules': [
+            {
+                'ID': 'DeleteScansAfter30Days',
+                'Status': 'Enabled',
+                'Filter': {'Prefix': ''},
+                'Expiration': {'Days': 30}
+            }
+        ]
+    }
+    try:
+        s3_client.put_bucket_lifecycle_configuration(
+            Bucket=S3_BUCKET,
+            LifecycleConfiguration=lifecycle_policy
+        )
+        print("✓ Storage Bucket 30-day lifecycle tiered policy enforced successfully.")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not configure object lifecycle policy: {e}")
 
 
 def anonymize_patient(patient_id: str, patient_name: str) -> str:

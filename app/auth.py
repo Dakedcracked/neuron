@@ -15,14 +15,9 @@ import bcrypt
 from app.database import Base, get_db, engine
 
 # ── JWT Config ──────────────────────────────────────────────────────────────
-import secrets
-NEURON_SECRET_KEY = os.environ.get("NEURON_SECRET_KEY")
-if not NEURON_SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
-    print("⚠️ WARNING: NEURON_SECRET_KEY is not set. A random session-based key has been generated. Logins will expire on restart.")
-else:
-    SECRET_KEY = NEURON_SECRET_KEY
+from app.config import JWT_SECRET, NEURON_ADMIN_USERNAME, NEURON_ADMIN_PASSWORD
 
+SECRET_KEY = JWT_SECRET
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
 
@@ -68,28 +63,19 @@ def create_access_token(data: dict) -> str:
 def seed_default_admin(db: Session):
     """
     Creates the default admin user on first startup if no users exist.
-    Loads username and password from environment variables if present.
+    Loads username and password from configuration properties.
     """
     existing = db.query(User).first()
     if not existing:
-        admin_username = os.environ.get("NEURON_ADMIN_USERNAME", "admin")
-        admin_password = os.environ.get("NEURON_ADMIN_PASSWORD")
-        
-        if not admin_password:
-            admin_password = "neuron2026"
-            print("⚠️ WARNING: NEURON_ADMIN_PASSWORD is not set. Seeding default admin user with password 'neuron2026'.")
-        else:
-            print("✓ Seeding default admin user with password from environment.")
-            
         admin = User(
-            username=admin_username,
-            hashed_password=hash_password(admin_password),
+            username=NEURON_ADMIN_USERNAME,
+            hashed_password=hash_password(NEURON_ADMIN_PASSWORD),
             role="admin",
             is_active=True,
         )
         db.add(admin)
         db.commit()
-        print(f"✓ Default admin user '{admin_username}' seeded successfully.")
+        print(f"✓ Default admin user '{NEURON_ADMIN_USERNAME}' seeded successfully.")
 
 
 # ── Auth Dependency ───────────────────────────────────────────────────────────

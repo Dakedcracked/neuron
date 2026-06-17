@@ -2,7 +2,6 @@ import os
 import time
 import json
 import tempfile
-import urllib.request
 from celery import Celery
 from app.inference import run_inference
 from app.database import SessionLocal, update_scan_result, Scan
@@ -11,35 +10,35 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery("neuron_worker", broker=REDIS_URL, backend=REDIS_URL)
 
+# Configure Celery process isolation to entirely neutralize PyTorch/MONAI memory leaks
+celery_app.conf.update(
+    worker_max_tasks_per_child=50,
+    worker_prefetch_multiplier=1
+)
+
 @celery_app.task(name="process_scan")
 def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
     print(f"⏳ [Celery] Starting background inference for Scan {scan_id}")
     
-    # 1. Download file from S3 to an ephemeral tempfile
+    # 1. Download file from S3/R2 directly via boto3 streams to an ephemeral tempfile
     fd, temp_path = tempfile.mkstemp()
     filename = s3_url.split("/")[-1]
     file_content = None
-    with os.fdopen(fd, 'wb') as f:
-        if s3_url.startswith("s3://") and "mock" in s3_url:
-            print("⚠ Mock S3 URL detected. Reading from local mock_s3_bucket.")
-            local_path = os.path.join(os.getcwd(), "mock_s3_bucket", filename)
-            if not os.path.exists(local_path):
-                print(f"Failed to find local mock file: {local_path}")
-                os.remove(temp_path)
-                return False
-            with open(local_path, "rb") as mock_f:
-                file_content = mock_f.read()
-                f.write(file_content)
-        else:
-            try:
-                req = urllib.request.Request(s3_url)
-                with urllib.request.urlopen(req) as response:
-                    file_content = response.read()
-                    f.write(file_content)
-            except Exception as e:
-                print(f"⚠ [Celery] Failed to download scan from S3: {e}")
-                os.remove(temp_path)
-                return False
+    
+    from app.utils import get_s3_client, S3_BUCKET
+    s3_client = get_s3_client()
+    
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            s3_client.download_fileobj(S3_BUCKET, filename, f)
+            
+        with open(temp_path, "rb") as f:
+            file_content = f.read()
+    except Exception as e:
+        print(f"❌ [Celery] Failed to download scan from Cloudflare R2/S3: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False
 
     # Extract img_base64 preview from the downloaded file
     from app.utils import preprocess_medical_file

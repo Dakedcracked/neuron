@@ -1,25 +1,17 @@
-import os
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, func
 from sqlalchemy.orm import declarative_base, sessionmaker
+from app.config import DATABASE_URL
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///neuron_clinic.db")
-
-# Only use check_same_thread for SQLite fallback
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-# Configure connection pooling parameters for production PostgreSQL databases
-pool_kwargs = {}
-if not DATABASE_URL.startswith("sqlite"):
-    pool_kwargs = {
-        "pool_size": int(os.environ.get("DB_POOL_SIZE", "50")),
-        "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", "100")),
-        "pool_timeout": 30,
-        "pool_recycle": 1800,
-    }
-
-engine = create_engine(DATABASE_URL, connect_args=connect_args, **pool_kwargs)
+# Hardened PostgreSQL engine with enterprise-grade connection pooling
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,
+    max_overflow=10,
+    pool_recycle=1800,
+    pool_pre_ping=True
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -75,11 +67,8 @@ def _seed_default_settings():
 
 
 def get_db():
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         yield db
-    finally:
-        db.close()
 
 
 # ── Write Operations ──────────────────────────────────────────────────────────
