@@ -81,17 +81,48 @@ export const InferenceView: React.FC<InferenceViewProps> = ({ onSuccess, onError
       controller.abort();
       setUploading(false);
       setProgress(0);
-      setTimeoutError('The workstation timed out (30s) waiting for edge model execution. Please check that model weights are fully initialized.');
+      setTimeoutError('The workstation timed out (60s) waiting for edge model execution. Please check that model weights are fully initialized.');
       onError('Clinical inference timeout.');
-    }, 30000);
+    }, 65000);
 
     try {
       setProgress(50);
       const res = await modelApi.uploadScan(file, modality);
+      
+      // Since the backend processes scans asynchronously, poll the status endpoint until completed or failed
+      const scanId = String(res.scan_id);
+      let pollCount = 0;
+      let completedScan: any = null;
+      
+      while (pollCount < 60) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        pollCount++;
+        
+        try {
+          const statusRes = await modelApi.getScanStatus(scanId);
+          if (statusRes.status === 'completed') {
+            completedScan = statusRes;
+            break;
+          } else if (statusRes.status === 'failed') {
+            throw new Error(statusRes.pathology_detected || 'Inference processing failed on the worker.');
+          }
+        } catch (pollErr: any) {
+          if (pollErr.message && pollErr.message.includes('failed')) {
+            throw pollErr;
+          }
+          console.error("Polling status error:", pollErr);
+        }
+      }
+      
       clearTimeout(timeoutId);
       setProgress(100);
-      setResult(res);
-      onSuccess(`AI Diagnostic completed: ${res.pathology_detected}`);
+      
+      if (completedScan) {
+        setResult(completedScan);
+        onSuccess(`AI Diagnostic completed: ${completedScan.pathology_detected}`);
+      } else {
+        throw new Error('Workstation timed out waiting for background worker inference.');
+      }
     } catch (err: any) {
       clearTimeout(timeoutId);
       onError(err.message || 'Inference processor failed.');
@@ -108,11 +139,15 @@ export const InferenceView: React.FC<InferenceViewProps> = ({ onSuccess, onError
     let metricValue = 'N/A (Classification)';
     let pValue = 'p < 0.05';
 
-    if (result.modality === 'XRAY') {
+    const modalityVal = result.modality || (result as any).scan_type;
+    const modelInfoVal = result.model_info || '';
+    const confidence = result.confidence_score !== undefined ? result.confidence_score : 0.0;
+
+    if (modalityVal === 'XRAY') {
       vram = '120 MB (DenseNet)';
-      pValue = `p = ${(1 - result.confidence_score).toFixed(4)}`;
+      pValue = `p = ${(1 - confidence).toFixed(4)}`;
     } else {
-      vram = result.model_info.toLowerCase().includes('unet') ? '6.45 GB (MONAI UNet)' : '512 MB (ResNet50)';
+      vram = modelInfoVal.toLowerCase().includes('unet') ? '6.45 GB (MONAI UNet)' : '512 MB (ResNet50)';
       metricLabel = 'Dice Coefficient';
       
       if (result.pathology_detected === 'Normal') {
@@ -120,10 +155,10 @@ export const InferenceView: React.FC<InferenceViewProps> = ({ onSuccess, onError
       } else if (result.pathology_detected === 'Inconclusive') {
         metricValue = '0.41 (Low Confidence)';
       } else {
-        metricValue = (0.85 + (result.confidence_score * 0.1)).toFixed(2);
+        metricValue = (0.85 + (confidence * 0.1)).toFixed(2);
       }
       
-      pValue = result.confidence_score > 0.85 ? 'p < 0.001' : `p = ${(1 - result.confidence_score).toFixed(4)}`;
+      pValue = confidence > 0.85 ? 'p < 0.001' : `p = ${(1 - confidence).toFixed(4)}`;
     }
 
     return {
@@ -419,8 +454,8 @@ export const InferenceView: React.FC<InferenceViewProps> = ({ onSuccess, onError
                 <div className="space-y-2 border-t border-clinical-border pt-4">
                   <span className="text-[8px] text-clinical-textMuted uppercase font-bold tracking-widest block mb-2">Probability Matrix</span>
                   <div className="space-y-2">
-                    {Object.entries(result.predictions).map(([name, value]) => {
-                      const percentage = (value * 100).toFixed(1);
+                    {result.predictions && Object.entries(result.predictions).map(([name, value]) => {
+                      const percentage = ((Number(value) || 0) * 100).toFixed(1);
                       const isMain = name === result.pathology_detected;
                       return (
                         <div key={name} className="space-y-1">

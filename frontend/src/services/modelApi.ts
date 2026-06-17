@@ -244,4 +244,16 @@ export const modelApi = {
 
     return data;
   },
+
+  async getScanStatus(scanId: string): Promise<ScanResult> {
+    const res = await fetch(`/api/scans/${scanId}`, {
+      headers: this.getHeaders(),
+    });
+
+    if (!res.ok) {
+      throw new Error('Failed to retrieve scan status.');
+    }
+
+    return res.json();
+  },
 };
