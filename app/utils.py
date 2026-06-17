@@ -319,12 +319,23 @@ def parse_dicom(file_content: bytes) -> dict:
 
     pixel_array = dataset.pixel_array.astype(np.float32)
 
+    # Explicitly extract rescale slope (0028,1053) and rescale intercept (0028,1052) values
     slope = 1.0
     intercept = 0.0
-    if hasattr(dataset, "RescaleSlope") and hasattr(dataset, "RescaleIntercept"):
+    rescale_slope_tag = (0x0028, 0x1053)
+    rescale_intercept_tag = (0x0028, 0x1052)
+    
+    if rescale_slope_tag in dataset:
+        slope = float(dataset[rescale_slope_tag].value)
+    elif hasattr(dataset, "RescaleSlope") and dataset.RescaleSlope is not None:
         slope = float(dataset.RescaleSlope)
+        
+    if rescale_intercept_tag in dataset:
+        intercept = float(dataset[rescale_intercept_tag].value)
+    elif hasattr(dataset, "RescaleIntercept") and dataset.RescaleIntercept is not None:
         intercept = float(dataset.RescaleIntercept)
-        pixel_array = pixel_array * slope + intercept
+        
+    pixel_array = pixel_array * slope + intercept
 
     # Generate multi-window 3-channel RGB composite
     rgb_composite = build_multi_window_rgb(pixel_array, modality)

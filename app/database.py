@@ -101,7 +101,7 @@ def update_scan_result(db, scan_id: str, pathology: str, confidence: float, late
         scan.predictions = predictions
         scan.bbox = bbox
         scan.priority = priority
-        scan.status = "triage" if priority in ("high", "critical") else "completed"
+        scan.status = "completed"
         db.commit()
 
 

@@ -10,6 +10,11 @@ import onnxruntime as ort
 import torch.nn as nn
 from pathlib import Path
 
+try:
+    import tritonclient.http as tritonhttp
+except ImportError:
+    tritonhttp = None
+
 app = FastAPI(
     title="Neuron AI — High-Performance Model Serving Server",
     version="2.0.0"
@@ -71,9 +76,9 @@ def load_models():
             xrv_state = torch.load(xrv_path, map_location="cpu")
             loaded_source = "clinical (RadImageNet fallback)"
         else:
-            temp_model = xrv.models.DenseNet(weights="densenet121-res224-all")
+            temp_model = xrv.models.DenseNet(weights=None)
             xrv_state = temp_model.state_dict()
-            loaded_source = "upstream (densenet121-res224-all)"
+            loaded_source = "upstream (densenet121-res224-all fallback)"
 
         print(f"✓ [Model Server] {loaded_source}-pretrained DenseNet121 base weights loaded.")
 
@@ -276,32 +281,48 @@ async def dynamic_batch_processor():
             inference_queue.task_done()
 
 
-# ── Grad-CAM Helpers ─────────────────────────────────────────────────────────
+# ── Triton Inference Helper ──────────────────────────────────────────────────
+def _execute_triton_inference_batch(np_arr: np.ndarray, model_name: str, input_name: str = "input", output_name: str = "output") -> np.ndarray:
+    """Sends batched arrays directly into Triton Inference Server pool."""
+    if tritonhttp is None:
+        raise RuntimeError("tritonclient.http package is not installed.")
+        
+    triton_url = os.environ.get("TRITON_SERVER_URL")
+    if not triton_url:
+        raise RuntimeError("TRITON_SERVER_URL is not set.")
+        
+    url_clean = triton_url.replace("http://", "").replace("https://", "")
+    client = tritonhttp.InferenceServerClient(url=url_clean)
+    
+    # FP16 precision mapping matching hardware requirements
+    datatype = "FP16" if np_arr.dtype == np.float16 else "FP32"
+    
+    infer_input = tritonhttp.InferInput(input_name, np_arr.shape, datatype)
+    infer_input.set_data_from_numpy(np_arr)
+    
+    infer_output = tritonhttp.InferRequestedOutput(output_name)
+    response = client.infer(model_name=model_name, inputs=[infer_input], outputs=[infer_output])
+    return response.as_numpy(output_name)
 
+
+# ── Grad-CAM Helpers ─────────────────────────────────────────────────────────
 def _resolve_gradcam_target_layer(model, modality: str):
     """Resolves the target layer for Grad-CAM based on model architecture."""
     if modality == "XRAY":
-        # DenseNet: features.norm5 is the standard target
         if hasattr(model, "features") and hasattr(model.features, "norm5"):
             return model.features.norm5
-        # Fallback: last child of features
         if hasattr(model, "features"):
             children = list(model.features.children())
             if children:
                 return children[-1]
     else:
-        # ResNet: layer4 is the standard target
         if hasattr(model, "layer4"):
             return model.layer4
     return None
 
 
 def _run_gradcam_for_sample(model, tensor_single, class_idx, modality, file_path):
-    """
-    Runs Grad-CAM on a single sample and returns (bbox, img_base64).
-    tensor_single: [1, C, H, W] tensor on CPU.
-    Returns (bbox_dict_or_None, base64_str_or_None).
-    """
+    """Runs Grad-CAM on a single sample and returns (bbox, img_base64)."""
     from app.inference import (
         GradCAM, extract_bbox_from_heatmap, _resize_heatmap,
         blend_image_and_heatmap, _convert_overlay_to_base64,
@@ -318,7 +339,6 @@ def _run_gradcam_for_sample(model, tensor_single, class_idx, modality, file_path
 
         bbox = extract_bbox_from_heatmap(heatmap_raw)
 
-        # Generate overlay image
         orig_img = _load_original_image_for_blending(file_path)
         h_orig, w_orig = orig_img.shape
         heatmap_resized = _resize_heatmap(heatmap_raw, (h_orig, w_orig))
@@ -332,15 +352,19 @@ def _run_gradcam_for_sample(model, tensor_single, class_idx, modality, file_path
 
 
 # ── Core Batch Inference ─────────────────────────────────────────────────────
-
 def execute_modality_batch(modality: str, requests: list) -> list:
-    """Runs 5-fold ensemble batch inference with dynamic Grad-CAM localization."""
+    """Runs 5-fold ensemble batch inference with dynamic Grad-CAM localization or Triton routing."""
     from app.inference import (
         _xray_transform, _volume_transform, _volume_transform_3d,
-        _build_unet_predictions, extract_bboxes_from_mask
+        _build_unet_predictions, extract_bboxes_from_mask,
+        _reconstruct_cam_from_activations, _resize_heatmap,
+        blend_image_and_heatmap, _convert_overlay_to_base64,
+        _load_original_image_for_blending, extract_bbox_from_heatmap
     )
 
     results = []
+    triton_url = os.environ.get("TRITON_SERVER_URL")
+    triton_active = triton_url and (tritonhttp is not None)
 
     # ── BATCH X-RAY ──────────────────────────────────────────────────────────
     if modality == "XRAY":
@@ -354,9 +378,7 @@ def execute_modality_batch(modality: str, requests: list) -> list:
             tensors.append(t)
 
         batched_tensor = torch.cat(tensors, dim=0).to(DEVICE)  # [B, 3, 224, 224]
-        if DEVICE.type == "cuda":
-            batched_tensor = batched_tensor.half()
-
+        
         xrv_labels = xray_folds[0].pathologies
         label_map = {
             "Pneumonia":       ["Pneumonia"],
@@ -371,16 +393,89 @@ def execute_modality_batch(modality: str, requests: list) -> list:
             "Normal":          [],
         }
 
-        # Run 5-fold ensemble
+        # Route to Triton if active with FP16 precision
+        if triton_active:
+            try:
+                np_arr = batched_tensor.cpu().numpy().astype(np.float16)
+                model_name = os.environ.get("TRITON_MODEL_XRAY", "densenet121_xrv")
+                
+                logits_np = _execute_triton_inference_batch(np_arr, model_name, output_name="output")
+                try:
+                    triton_activations = _execute_triton_inference_batch(np_arr, model_name, output_name="norm5")
+                except Exception:
+                    triton_activations = None
+                
+                xrv_out = torch.tensor(logits_np)
+                for idx, r in enumerate(requests):
+                    probs_raw = torch.sigmoid(xrv_out[idx]).cpu().numpy()
+                    pred_map = {}
+                    for our_label, xrv_synonyms in label_map.items():
+                        score = 0.0
+                        for syn in xrv_synonyms:
+                            if syn in xrv_labels:
+                                l_idx = list(xrv_labels).index(syn)
+                                score = max(score, float(probs_raw[l_idx]))
+                        pred_map[our_label] = score
+                    
+                    max_abnormal = max(v for k, v in pred_map.items() if k != "Normal")
+                    pred_map["Normal"] = max(0.0, 1.0 - max_abnormal)
+                    total = sum(pred_map.values())
+                    pred_map = {k: v / total for k, v in pred_map.items()}
+                    
+                    pathology = max(pred_map, key=pred_map.get)
+                    confidence = float(pred_map[pathology])
+                    
+                    bbox = None
+                    img_b64 = None
+                    if pathology not in ("Normal", "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"):
+                        target_class_idx = None
+                        syns = label_map.get(pathology, [])
+                        for syn in syns:
+                            if syn in xrv_labels:
+                                target_class_idx = list(xrv_labels).index(syn)
+                                break
+                                
+                        if target_class_idx is not None:
+                            if triton_activations is not None:
+                                weights = xrv_model.classifier.weight.data.cpu().numpy()
+                                heatmap_raw = _reconstruct_cam_from_activations(triton_activations[idx], weights[target_class_idx])
+                                h_orig, w_orig = _load_original_image_for_blending(r["file_path"]).shape
+                                heatmap = _resize_heatmap(heatmap_raw, (h_orig, w_orig))
+                                bbox = extract_bbox_from_heatmap(heatmap)
+                                orig_img = _load_original_image_for_blending(r["file_path"])
+                                blended = blend_image_and_heatmap(orig_img, heatmap)
+                                img_b64 = _convert_overlay_to_base64(blended)
+                            else:
+                                single_tensor = tensors[idx].float()
+                                bbox, img_b64 = _run_gradcam_for_sample(
+                                    xrv_model, single_tensor, target_class_idx, "XRAY", r["file_path"]
+                                )
+                                
+                    results.append({
+                        "pathology_detected": pathology,
+                        "confidence_score": confidence,
+                        "bbox": bbox,
+                        "predictions": pred_map,
+                        "pytorch_executed": True,
+                        "model_info": "MONAI ModelServer (Triton DenseNet FP16 Batched)",
+                        "img_base64": img_b64,
+                    })
+                return results
+            except Exception as e:
+                print(f"⚠ Triton batch inference failed: {e}. Falling back to local ensembles.")
+
+        if DEVICE.type == "cuda":
+            batched_tensor = batched_tensor.half()
+
+        # Run 5-fold ensemble locally
         all_fold_outputs = []
         for fold_model in xray_folds:
             with torch.inference_mode():
-                outputs = fold_model(batched_tensor)  # [B, 18]
+                outputs = fold_model(batched_tensor)
             probs_raw = torch.sigmoid(outputs).cpu().numpy()
             all_fold_outputs.append(probs_raw)
 
         for idx, r in enumerate(requests):
-            # Collect per-fold prediction maps
             fold_predictions = []
             for fold_idx, fold_probs_raw in enumerate(all_fold_outputs):
                 probs = fold_probs_raw[idx]
@@ -399,7 +494,6 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 pred_map_fold = {k: v / total for k, v in pred_map_fold.items()}
                 fold_predictions.append(pred_map_fold)
 
-            # Weighted soft-voting mean + std deviation
             all_labels = list(label_map.keys())
             mean_probs = {}
             std_probs = {}
@@ -408,11 +502,10 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 mean_probs[c] = float(np.sum([p * w for p, w in zip(probs_c, FOLD_WEIGHTS)]))
                 std_probs[c] = float(np.std(probs_c))
 
-            # Clinical variance triage
             max_variance = max(std_probs.values())
             if max_variance > 0.15:
                 print(f"🚨 CLINICAL DISCREPANCY: XRAY fold variance {max_variance:.4f} > 0.15 — triggering triage.")
-                pathology = "Inconclusive (Discrepancy Triage)"
+                pathology = "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"
                 confidence = 0.0
                 pred_map = mean_probs
             else:
@@ -420,11 +513,9 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
 
-            # Dynamic Grad-CAM bbox + overlay
             bbox = None
             img_b64 = None
-            if pathology not in ("Normal", "Inconclusive (Discrepancy Triage)"):
-                # Find class index for Grad-CAM on the primary fold model
+            if pathology not in ("Normal", "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"):
                 target_class_idx = None
                 syns = label_map.get(pathology, [])
                 for syn in syns:
@@ -433,7 +524,7 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                         break
 
                 if target_class_idx is not None:
-                    single_tensor = tensors[idx].float()  # [1, 3, 224, 224] back to float for grad
+                    single_tensor = tensors[idx].float()
                     bbox, img_b64 = _run_gradcam_for_sample(
                         xrv_model, single_tensor, target_class_idx, "XRAY", r["file_path"]
                     )
@@ -457,14 +548,48 @@ def execute_modality_batch(modality: str, requests: list) -> list:
             t3d = _volume_transform_3d(r["file_path"])  # [1, 1, 96, 96, 96]
             tensors_3d.append(t3d)
 
-        # 1. Try ONNX SegResNet Inference (Dynamic Batching)
+        # Route to Triton if active for SegResNet with FP16
+        if triton_active and modality == "MRI" and segresnet_available:
+            try:
+                batched_3d = torch.cat(tensors_3d, dim=0)
+                batched_3d = batched_3d.repeat(1, 4, 1, 1, 1)
+                np_arr = batched_3d.numpy().astype(np.float16)
+                model_name = os.environ.get("TRITON_MODEL_SEGRESNET", "segresnet_mri")
+                
+                logits = _execute_triton_inference_batch(np_arr, model_name, output_name="output")
+                for seg_idx, r in enumerate(requests):
+                    l_logits = logits[seg_idx]
+                    probs = np.exp(l_logits) / np.sum(np.exp(l_logits), axis=0, keepdims=True)
+                    tumor_mask = probs[1]
+
+                    lesion_score = float(np.clip(tumor_mask.mean() * 15.0, 0, 1))
+                    bbox = extract_bboxes_from_mask(tumor_mask, threshold=0.1)
+
+                    pred_map = _build_unet_predictions(modality, lesion_score)
+                    pathology = max(pred_map, key=pred_map.get)
+                    confidence = float(pred_map[pathology])
+
+                    results.append({
+                        "pathology_detected": pathology,
+                        "confidence_score": confidence,
+                        "bbox": bbox,
+                        "predictions": pred_map,
+                        "pytorch_executed": True,
+                        "model_info": "MONAI ModelServer (Triton SegResNet FP16 Batched)",
+                        "img_base64": None,
+                    })
+                return results
+            except Exception as e:
+                print(f"⚠ Triton SegResNet batch failed: {e}. Falling back to ResNet ensemble.")
+
+        # Local SegResNet ONNX runtime path
         if segresnet_available:
             try:
                 batched_3d = torch.cat(tensors_3d, dim=0)
                 batched_3d = batched_3d.repeat(1, 4, 1, 1, 1)
 
                 ort_inputs = {"input": batched_3d.numpy().astype(np.float32)}
-                logits = segresnet_session.run(["output"], ort_inputs)[0]  # [B, 3, 96, 96, 96]
+                logits = segresnet_session.run(["output"], ort_inputs)[0]
 
                 for seg_idx, r in enumerate(requests):
                     l_logits = logits[seg_idx]
@@ -491,7 +616,7 @@ def execute_modality_batch(modality: str, requests: list) -> list:
             except Exception as e:
                 print(f"⚠ ONNX batch session failed: {e}. Falling back to ResNet ensemble.")
 
-        # 2. ResNet-50 5-Fold Ensemble Fallback
+        # ResNet-50 Ensemble
         folds = ct_folds if modality == "CT" else mri_folds
         model = ct_model if modality == "CT" else mri_model
         pathologies = (
@@ -501,7 +626,6 @@ def execute_modality_batch(modality: str, requests: list) -> list:
         )
 
         if model is None or len(folds) == 0:
-            # Complete Fallback (Inconclusive)
             for r in requests:
                 results.append({
                     "pathology_detected": "Inconclusive",
@@ -514,17 +638,72 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 })
             return results
 
-        # Prepare 2D tensors for ResNet
         tensors = []
         for r in requests:
             t = _volume_transform(r["file_path"])  # [1, 3, 224, 224]
             tensors.append(t)
 
         batched_tensor = torch.cat(tensors, dim=0).to(DEVICE)  # [B, 3, 224, 224]
+
+        # Route to Triton if active for ResNet-50 with FP16
+        if triton_active:
+            try:
+                np_arr = batched_tensor.cpu().numpy().astype(np.float16)
+                model_name = os.environ.get("TRITON_MODEL_RESNET", f"resnet50_{modality.lower()}")
+                
+                logits_np = _execute_triton_inference_batch(np_arr, model_name, output_name="output")
+                try:
+                    triton_activations = _execute_triton_inference_batch(np_arr, model_name, output_name="layer4")
+                except Exception:
+                    triton_activations = None
+                
+                raw_probs = torch.softmax(torch.tensor(logits_np), dim=1).cpu().numpy()
+                for idx, r in enumerate(requests):
+                    probs = raw_probs[idx]
+                    pred_map = dict(zip(pathologies, probs.tolist()))
+                    pathology = max(pred_map, key=pred_map.get)
+                    confidence = float(pred_map[pathology])
+
+                    bbox = None
+                    img_b64 = None
+                    if pathology not in ("Normal", "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"):
+                        target_class_idx = None
+                        if pathology in pathologies:
+                            target_class_idx = pathologies.index(pathology)
+
+                        if target_class_idx is not None and target_class_idx < len(pathologies) - 1:
+                            if triton_activations is not None:
+                                weights = model.fc.weight.data.cpu().numpy()
+                                heatmap_raw = _reconstruct_cam_from_activations(triton_activations[idx], weights[target_class_idx])
+                                h_orig, w_orig = _load_original_image_for_blending(r["file_path"]).shape
+                                heatmap = _resize_heatmap(heatmap_raw, (h_orig, w_orig))
+                                bbox = extract_bbox_from_heatmap(heatmap)
+                                orig_img = _load_original_image_for_blending(r["file_path"])
+                                blended = blend_image_and_heatmap(orig_img, heatmap)
+                                img_b64 = _convert_overlay_to_base64(blended)
+                            else:
+                                single_tensor = tensors[idx].float()
+                                bbox, img_b64 = _run_gradcam_for_sample(
+                                    model, single_tensor, target_class_idx, modality, r["file_path"]
+                                )
+
+                    results.append({
+                        "pathology_detected": pathology,
+                        "confidence_score": confidence,
+                        "bbox": bbox,
+                        "predictions": pred_map,
+                        "pytorch_executed": True,
+                        "model_info": "MONAI ModelServer (Triton ResNet FP16 Batched)",
+                        "img_base64": img_b64,
+                    })
+                return results
+            except Exception as e:
+                print(f"⚠ Triton ResNet batch inference failed: {e}. Falling back to local ensembles.")
+
         if DEVICE.type == "cuda":
             batched_tensor = batched_tensor.half()
 
-        # Run 5-fold ensemble
+        # Run 5-fold ensemble locally
         all_fold_outputs = []
         for fold_model in folds:
             with torch.inference_mode():
@@ -539,7 +718,6 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 pred_map_fold = dict(zip(pathologies, probs.tolist()))
                 fold_predictions.append(pred_map_fold)
 
-            # Weighted soft-voting mean + std deviation
             mean_probs = {}
             std_probs = {}
             for c in pathologies:
@@ -547,11 +725,10 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 mean_probs[c] = float(np.sum([p * w for p, w in zip(probs_c, FOLD_WEIGHTS)]))
                 std_probs[c] = float(np.std(probs_c))
 
-            # Clinical variance triage
             max_variance = max(std_probs.values())
             if max_variance > 0.15:
                 print(f"🚨 CLINICAL DISCREPANCY: {modality} fold variance {max_variance:.4f} > 0.15 — triggering triage.")
-                pathology = "Inconclusive (Discrepancy Triage)"
+                pathology = "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"
                 confidence = 0.0
                 pred_map = mean_probs
             else:
@@ -559,16 +736,15 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
 
-            # Dynamic Grad-CAM bbox + overlay
             bbox = None
             img_b64 = None
-            if pathology not in ("Normal", "Inconclusive (Discrepancy Triage)"):
+            if pathology not in ("Normal", "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"):
                 target_class_idx = None
                 if pathology in pathologies:
                     target_class_idx = pathologies.index(pathology)
 
                 if target_class_idx is not None and target_class_idx < len(pathologies) - 1:
-                    single_tensor = tensors[idx].float()  # [1, 3, 224, 224] back to float for grad
+                    single_tensor = tensors[idx].float()
                     bbox, img_b64 = _run_gradcam_for_sample(
                         model, single_tensor, target_class_idx, modality, r["file_path"]
                     )
@@ -579,7 +755,7 @@ def execute_modality_batch(modality: str, requests: list) -> list:
                 "bbox": bbox,
                 "predictions": pred_map,
                 "pytorch_executed": True,
-                "model_info": f"MONAI ModelServer (ResNet50 5-Fold Ensemble Batched)",
+                "model_info": "MONAI ModelServer (ResNet50 5-Fold Ensemble Batched)",
                 "img_base64": img_b64,
             })
 
@@ -587,16 +763,13 @@ def execute_modality_batch(modality: str, requests: list) -> list:
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
-
 @app.post("/predict")
 async def predict(
     file_path: str = Form(...),
     modality: str = Form(...),
     patient_hash: str = Form(...)
 ):
-    """
-    Submits a prediction request to the dynamic batch queue.
-    """
+    """Submits a prediction request to the dynamic batch queue."""
     if not os.path.exists(file_path):
         raise HTTPException(status_code=400, detail="Target file path not found.")
         
@@ -608,7 +781,6 @@ async def predict(
         "future": future
     })
     
-    # Wait for the batch processor to complete the prediction
     try:
         result = await future
         return result

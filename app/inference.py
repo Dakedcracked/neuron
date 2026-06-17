@@ -992,7 +992,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                     max_variance = max(std_probs.values())
                     if max_variance > 0.15:
                         print(f"🚨 CLINICAL DISCREPANCY DETECTED: Max XRAY fold variance {max_variance:.4f} exceeds threshold 0.15. Triggering safety override.")
-                        pathology = "Inconclusive (Discrepancy Triage)"
+                        pathology = "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"
                         confidence = 0.0
                         pred_map = mean_probs
                     else:
@@ -1033,7 +1033,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                     max_variance = max(std_probs.values())
                     if max_variance > 0.15:
                         print(f"🚨 CLINICAL DISCREPANCY DETECTED: Max CT fold variance {max_variance:.4f} exceeds threshold 0.15. Triggering safety override.")
-                        pathology = "Inconclusive (Discrepancy Triage)"
+                        pathology = "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"
                         confidence = 0.0
                         pred_map = mean_probs
                     else:
@@ -1093,7 +1093,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                     max_variance = max(std_probs.values())
                     if max_variance > 0.15:
                         print(f"🚨 CLINICAL DISCREPANCY DETECTED: Max MRI fold variance {max_variance:.4f} exceeds threshold 0.15. Triggering safety override.")
-                        pathology = "Inconclusive (Discrepancy Triage)"
+                        pathology = "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"
                         confidence = 0.0
                         pred_map = mean_probs
                     else:
@@ -1130,7 +1130,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
     bbox = None
     
     # If the prediction logic successfully completed:
-    if pytorch_success and pathology not in ("Normal", INCONCLUSIVE_LABEL, "Inconclusive (Discrepancy Triage)"):
+    if pytorch_success and pathology not in ("Normal", INCONCLUSIVE_LABEL, "Inconclusive (Discrepancy Triage: Requires Specialist Verification)"):
         
         # ── MedSAM Segmentation & BBox Routing (CT/MRI) ───────────────────────
         if modality in ("CT", "MRI"):
