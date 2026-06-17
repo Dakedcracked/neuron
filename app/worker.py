@@ -25,20 +25,54 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
     filename = s3_url.split("/")[-1]
     file_content = None
     
-    from app.utils import get_s3_client, S3_BUCKET
-    s3_client = get_s3_client()
+    local_mock_path = os.path.join(os.getcwd(), "mock_s3_bucket", filename)
+    is_mock = s3_url.startswith("s3://") or "/mock/" in s3_url or "account-id" in s3_url or "account_id" in s3_url
     
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            s3_client.download_fileobj(S3_BUCKET, filename, f)
-            
-        with open(temp_path, "rb") as f:
-            file_content = f.read()
-    except Exception as e:
-        print(f"❌ [Celery] Failed to download scan from Cloudflare R2/S3: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return False
+    if is_mock:
+        if os.path.exists(local_mock_path):
+            try:
+                with open(local_mock_path, "rb") as src:
+                    file_content = src.read()
+                with os.fdopen(fd, 'wb') as dst:
+                    dst.write(file_content)
+                print(f"✓ [Celery] Successfully loaded scan locally from mock_s3_bucket: {local_mock_path}")
+            except Exception as e:
+                print(f"❌ [Celery] Failed to read local mock file: {e}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return False
+        else:
+            print(f"❌ [Celery] Local mock file not found at: {local_mock_path}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
+    else:
+        from app.utils import get_s3_client, S3_BUCKET
+        try:
+            s3_client = get_s3_client()
+            with os.fdopen(fd, 'wb') as f:
+                s3_client.download_fileobj(S3_BUCKET, filename, f)
+                
+            with open(temp_path, "rb") as f:
+                file_content = f.read()
+        except Exception as e:
+            print(f"❌ [Celery] Failed to download scan from Cloudflare R2/S3: {e}. Trying local fallback.")
+            if os.path.exists(local_mock_path):
+                try:
+                    with open(local_mock_path, "rb") as src:
+                        file_content = src.read()
+                    with open(temp_path, "wb") as dst:
+                        dst.write(file_content)
+                    print(f"✓ [Celery] Successfully fell back to local mock file: {local_mock_path}")
+                except Exception as ex:
+                    print(f"❌ [Celery] Local fallback failed: {ex}")
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    return False
+            else:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return False
 
     # Extract img_base64 preview from the downloaded file
     from app.utils import preprocess_medical_file

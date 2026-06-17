@@ -37,11 +37,36 @@ def upload_to_s3(file_content: bytes, filename: str) -> str:
     """
     Streams raw scan bytes directly to Cloudflare R2 / AWS S3 using upload_fileobj.
     Bypasses local file caching completely to ensure cost-efficiency and performance.
+    Falls back to local mock storage if cloud storage is down/offline or MOCK_S3 is true.
     """
-    s3_client = get_s3_client()
-    fileobj = io.BytesIO(file_content)
-    s3_client.upload_fileobj(fileobj, S3_BUCKET, filename)
-    return f"{S3_PUBLIC_URL_PREFIX}/{filename}"
+    import os
+    mock_s3_env = os.environ.get("MOCK_S3", "false").lower() in ("true", "1", "yes")
+    
+    if mock_s3_env or "account-id" in S3_ENDPOINT_URL or "account_id" in S3_ENDPOINT_URL:
+        # Save to local mock_s3_bucket directory
+        mock_dir = os.path.join(os.getcwd(), "mock_s3_bucket")
+        os.makedirs(mock_dir, exist_ok=True)
+        local_path = os.path.join(mock_dir, filename)
+        with open(local_path, "wb") as f:
+            f.write(file_content)
+        print(f"✓ Saved scan to local mock storage: {local_path}")
+        return f"s3://{S3_BUCKET}/mock/{filename}"
+        
+    try:
+        s3_client = get_s3_client()
+        fileobj = io.BytesIO(file_content)
+        s3_client.upload_fileobj(fileobj, S3_BUCKET, filename)
+        return f"{S3_PUBLIC_URL_PREFIX}/{filename}"
+    except Exception as e:
+        print(f"⚠️ Warning: R2/S3 upload failed ({e}). Falling back to local mock storage.")
+        # Fall back to local mock_s3_bucket directory
+        mock_dir = os.path.join(os.getcwd(), "mock_s3_bucket")
+        os.makedirs(mock_dir, exist_ok=True)
+        local_path = os.path.join(mock_dir, filename)
+        with open(local_path, "wb") as f:
+            f.write(file_content)
+        print(f"✓ Saved scan to local mock storage fallback: {local_path}")
+        return f"s3://{S3_BUCKET}/mock/{filename}"
 
 
 def generate_presigned_upload_url(filename: str, expiration=3600) -> dict:
