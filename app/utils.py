@@ -8,8 +8,39 @@ import nibabel as nib
 from PIL import Image
 import torch
 
+import boto3
+from botocore.exceptions import NoCredentialsError
+
 CLINIC_SALT = os.environ.get("NEURON_CLINIC_SALT", "neuron_secure_salt_2026")
-TEMP_UPLOAD_DIR = "temp_uploads"
+S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "neuron-clinical-scans")
+S3_REGION = os.environ.get("S3_REGION", "ap-south-1")
+
+def upload_to_s3(file_content: bytes, filename: str) -> str:
+    """
+    Uploads the raw DICOM/NIfTI file to AWS S3 / Cloudflare R2.
+    Returns the public/presigned URL.
+    """
+    # For MVP local development, we mock S3 unless credentials are explicitly provided
+    if os.environ.get("MOCK_S3", "true").lower() == "true":
+        mock_bucket = os.path.join(os.getcwd(), "mock_s3_bucket")
+        os.makedirs(mock_bucket, exist_ok=True)
+        local_path = os.path.join(mock_bucket, filename)
+        with open(local_path, "wb") as f:
+            f.write(file_content)
+        return f"s3://{S3_BUCKET}/mock/{filename}"
+        
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+        region_name=S3_REGION
+    )
+    try:
+        s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_content)
+        return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{filename}"
+    except NoCredentialsError:
+        print("⚠ AWS Credentials not available. Skipping S3 upload.")
+        return f"s3://{S3_BUCKET}/failed_upload/{filename}"
 
 
 def anonymize_patient(patient_id: str, patient_name: str) -> str:
@@ -99,7 +130,6 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
         - metadata (demographics and study details)
     """
     name_lower = filename.lower()
-    os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
 
     if name_lower.endswith(".dcm"):
         dicom_data = parse_dicom(file_content)
@@ -119,11 +149,11 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
         }
 
     elif name_lower.endswith(".nii") or name_lower.endswith(".nii.gz"):
-        # ✅ FIXED: Write temp file to temp_uploads/ instead of CWD
+        # ✅ FIXED: Use system ephemeral tempfile instead of local directory
         temp_ext = ".nii.gz" if name_lower.endswith(".gz") else ".nii"
-        temp_name = os.path.join(TEMP_UPLOAD_DIR, f"_load_{os.getpid()}{temp_ext}")
-
-        with open(temp_name, "wb") as f:
+        import tempfile
+        fd, temp_name = tempfile.mkstemp(suffix=temp_ext)
+        with os.fdopen(fd, 'wb') as f:
             f.write(file_content)
 
         try:

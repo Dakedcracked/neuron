@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.vscode/
+temp_uploads/
+eval/
+mock_s3_bucket/
+*.db

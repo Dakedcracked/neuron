@@ -91,9 +91,21 @@ export const useMedicalParser = () => {
         const ext = file.name.toLowerCase();
         if (ext.endsWith('.png') || ext.endsWith('.jpg') || ext.endsWith('.jpeg')) {
           format = 'StandardImage';
-          modalityDetected = 'XRAY';
-          extractedMetadata.description = 'Chest X-Ray Digital Projection (2D)';
-          extractedMetadata.manufacturer = 'Carestream Health';
+          const lowerName = file.name.toLowerCase();
+          if (lowerName.includes('mri') || lowerName.includes('brain')) {
+            modalityDetected = 'MRI';
+            extractedMetadata.description = 'MRI Slice (2D)';
+          } else if (lowerName.includes('ct') || lowerName.includes('abdominal')) {
+            modalityDetected = 'CT';
+            extractedMetadata.description = 'CT Slice (2D)';
+          } else if (lowerName.includes('xray') || lowerName.includes('chest')) {
+            modalityDetected = 'XRAY';
+            extractedMetadata.description = 'Chest X-Ray Digital Projection (2D)';
+          } else {
+            modalityDetected = 'Unknown';
+            extractedMetadata.description = 'Standard Medical Image (2D)';
+          }
+          extractedMetadata.manufacturer = 'Generic Workstation';
           dimensions = '1024 x 1024 (2D)';
         }
       }

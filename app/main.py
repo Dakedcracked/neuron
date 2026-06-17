@@ -12,9 +12,10 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from app.database import init_db, get_db, log_scan, get_dashboard_metrics, get_scan_history, update_clinic_setting, get_clinic_settings, SessionLocal as AuthSession
+from app.database import init_db, get_db, create_pending_scan, get_dashboard_metrics, get_scan_history, update_clinic_setting, get_clinic_settings, SessionLocal as AuthSession, Scan
 from app.utils import preprocess_medical_file
 from app.inference import run_inference
+from app.worker import process_scan
 from app.auth import (
     User, seed_default_admin, get_current_user, get_admin_user,
     verify_password, hash_password, create_access_token,
@@ -91,7 +92,7 @@ async def models_page(request: Request):
 # ── Auth API ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/auth/login")
-@limiter.limit("10/minute")
+@limiter.limit("50/minute")
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
     """Validates credentials and returns JWT access token."""
     db = AuthSession()
@@ -167,11 +168,6 @@ async def upload_scan(
         patient_hash = prepped["patient_hash"]
         modality_from_file = prepped["modality"]
         modality_override = modality.upper() if modality else None
-        if ext.endswith((".png", ".jpg", ".jpeg")) and modality_override in {"CT", "MRI"}:
-            raise HTTPException(
-                status_code=400,
-                detail="CT/MRI uploads require DICOM or NIfTI files.",
-            )
         if modality_override in {"XRAY", "CT", "MRI"} and not ext.endswith(".dcm"):
             modality = modality_override
         else:
@@ -179,45 +175,28 @@ async def upload_scan(
         img_base64 = prepped["img_base64"]
         metadata = prepped["metadata"]
 
-        os.makedirs("temp_uploads", exist_ok=True)
-        temp_path = os.path.join("temp_uploads", filename)
-        with open(temp_path, "wb") as f:
-            f.write(content)
+        from app.utils import upload_to_s3
+        import tempfile
+        # 1. Permanently store the raw scan in S3/R2
+        s3_url = upload_to_s3(content, filename)
 
-        import time
-        try:
-            t_start = time.perf_counter()
-            inference_out = run_inference(temp_path, modality, patient_hash)
-            inference_latency = (time.perf_counter() - t_start) * 1000.0  # latency in ms
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+        # 2. Register the scan in the DB as "Pending"
+        logged = create_pending_scan(db=db, patient_hash=patient_hash, scan_type=modality, s3_url=s3_url)
+        logged.img_base64 = img_base64
+        db.commit()
 
-        logged = log_scan(
-            db=db,
-            patient_hash=patient_hash,
-            scan_type=modality,
-            pathology_detected=inference_out["pathology_detected"],
-            confidence_score=inference_out["confidence_score"],
-            inference_latency=inference_latency,
-            pytorch_executed=inference_out["pytorch_executed"],
-        )
+        # 3. Dispatch the Celery task (non-blocking)
+        process_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality, patient_hash=patient_hash)
 
         return {
-            "status": "success",
+            "status": "pending",
             "scan_id": logged.id,
             "patient_hash": patient_hash,
             "modality": modality,
             "metadata": metadata,
-            "pathology_detected": inference_out["pathology_detected"],
-            "confidence_score": inference_out["confidence_score"],
-            "predictions": inference_out["predictions"],
-            "bbox": inference_out["bbox"],
-            "inference_latency": inference_latency,
             "img_base64": img_base64,
-            "timestamp": logged.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "pytorch_executed": inference_out["pytorch_executed"],
-            "model_info": inference_out["model_info"],
+            "timestamp": logged.timestamp.strftime("%Y-%m-%d %H:%M:%S") if logged.timestamp else None,
+            "message": "Scan uploaded and queued for background inference.",
         }
 
     except HTTPException:
@@ -241,6 +220,31 @@ async def dashboard_metrics(
 
 
 # ── Scan History API ──────────────────────────────────────────────────────────
+
+@app.get("/api/scans/{scan_id}")
+async def get_scan_status(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    
+    import json
+    return {
+        "id": scan.id,
+        "status": scan.status,
+        "patient_hash": scan.patient_hash,
+        "scan_type": scan.scan_type,
+        "pathology_detected": scan.pathology_detected,
+        "confidence_score": scan.confidence_score,
+        "predictions": json.loads(scan.predictions) if scan.predictions else None,
+        "bbox": json.loads(scan.bbox) if scan.bbox else None,
+        "img_base64": scan.img_base64,
+        "inference_latency": scan.inference_latency,
+        "timestamp": scan.timestamp.strftime("%Y-%m-%d %H:%M:%S") if scan.timestamp else None,
+    }
 
 @app.get("/api/scans")
 async def scan_history(

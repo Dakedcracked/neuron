@@ -10,6 +10,7 @@ from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from sqlalchemy import Column, String, DateTime, Boolean
 from sqlalchemy.orm import declarative_base
+import bcrypt
 
 from app.database import Base, get_db, engine
 
@@ -19,7 +20,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
 
 # ── Password Hashing ─────────────────────────────────────────────────────────
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Replaced passlib with direct bcrypt to avoid ValueError on large inputs
 
 # ── Bearer Token Extractor ───────────────────────────────────────────────────
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -39,11 +40,15 @@ class User(Base):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        # bcrypt limits passwords to 72 bytes. Slice to 72 to prevent ValueError.
+        return bcrypt.checkpw(plain.encode("utf-8")[:72], hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return bcrypt.hashpw(plain.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
 
 
 def create_access_token(data: dict) -> str:

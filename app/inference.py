@@ -25,11 +25,12 @@ RESNET_WEIGHT_PATHS = [
     MODEL_DIR / "resnet50_imagenet.pt",
 ]
 UNET_WEIGHT_PATH = MODEL_DIR / "unet3d_stub.pt"
+SEGRESNET_ONNX_PATH = MODEL_DIR / "segresnet_mri.onnx"
 
 xrv_model = None       # torchxrayvision DenseNet for X-Ray
 ct_model = None        # ResNet50 for CT
 mri_model = None       # ResNet50 for MRI
-unet3d_model = None    # MONAI 3D UNet for CT/MRI
+segresnet_session = None # MONAI SegResNet (ONNX) for MRI/PET
 
 ALLOW_DEMO_MODELS = os.environ.get("NEURON_ALLOW_DEMO_MODELS", "false").lower() in {"1", "true", "yes"}
 INCONCLUSIVE_LABEL = "Inconclusive"
@@ -123,30 +124,18 @@ except Exception:
     MONAI_AVAILABLE = False
 
 try:
-    from monai.networks.nets import UNet
-    if UNET_WEIGHT_PATH.exists():
-        unet3d_model = UNet(
-            spatial_dims=3,
-            in_channels=1,
-            out_channels=2,
-            channels=(16, 32, 64, 128),
-            strides=(2, 2, 2),
-            num_res_units=2,
-        )
-        state = _load_state_dict(UNET_WEIGHT_PATH)
-        if state is not None:
-            unet3d_model.load_state_dict(state, strict=False)
-            unet3d_model.to(DEVICE)
-            unet3d_model.eval()
-            unet_is_stub = "stub" in UNET_WEIGHT_PATH.name.lower()
-            UNET_CLINICAL = not unet_is_stub
-            UNET_AVAILABLE = UNET_CLINICAL or (ALLOW_DEMO_MODELS and not UNET_CLINICAL)
-            if UNET_CLINICAL:
-                print("✓ MONAI 3D UNet loaded with clinical weights.")
-            elif UNET_AVAILABLE:
-                print("⚠ MONAI 3D UNet loaded with stub weights (demo mode).")
+    import onnxruntime as ort
+    if SEGRESNET_ONNX_PATH.exists():
+        print("⏳ Loading MONAI SegResNet (ONNX) for MRI/PET...")
+        segresnet_session = ort.InferenceSession(str(SEGRESNET_ONNX_PATH), providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        UNET_AVAILABLE = True
+        UNET_CLINICAL = True
+        print("✓ MONAI SegResNet ONNX model loaded successfully.")
+    else:
+        print("⚠ SegResNet ONNX model missing (run export_engine.py)")
 except Exception as e:
-    print(f"⚠ MONAI UNet unavailable — CT/MRI UNet path disabled: {e}")
+    print(f"⚠ MONAI SegResNet ONNX unavailable: {e}")
+    segresnet_session = None
 
 
 def _xray_transform(file_path: str) -> torch.Tensor:
@@ -237,6 +226,38 @@ def _volume_transform_3d(file_path: str) -> torch.Tensor:
 
 
 # ── Main Inference Entry Point ────────────────────────────────────────────────
+
+def extract_bboxes_from_mask(mask_3d: np.ndarray, threshold=0.5):
+    """
+    Given a [D, H, W] mask, find the largest connected component and 
+    project its bounding box to 2D for the center slice.
+    """
+    try:
+        from scipy.ndimage import find_objects, label
+        binary_mask = (mask_3d > threshold).astype(int)
+        labeled_mask, num_features = label(binary_mask)
+        if num_features == 0:
+            return None
+        
+        # Get bounding boxes of all components
+        slices = find_objects(labeled_mask)
+        # Find the largest component by volume
+        largest_slice = max(slices, key=lambda s: np.prod([sl.stop - sl.start for sl in s]))
+        
+        z_slice, y_slice, x_slice = largest_slice
+        
+        # Map back to 224x224 (assuming frontend displays this or 96x96 resized)
+        # Since we pooled to 96x96, we scale coordinates back by 224/96
+        scale = 224.0 / 96.0
+        x = int(x_slice.start * scale)
+        y = int(y_slice.start * scale)
+        w = max(10, int((x_slice.stop - x_slice.start) * scale))
+        h = max(10, int((y_slice.stop - y_slice.start) * scale))
+        
+        return {"x": x, "y": y, "w": w, "h": h, "label": "Detected Lesion (AI Traced)"}
+    except Exception as e:
+        print(f"⚠ Bbox extraction failed: {e}")
+        return None
 
 def _build_unet_predictions(modality: str, lesion_score: float) -> dict:
     """Maps UNet lesion score to modality-specific pathology probabilities."""
@@ -340,21 +361,30 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
     elif modality == "CT":
         pathologies = ["Renal Calculi", "Hepatic Lesion", "Appendicitis", "Normal"]
 
-        if UNET_AVAILABLE:
+        bbox = None
+        if UNET_AVAILABLE and segresnet_session is not None:
             try:
-                tensor = _volume_transform_3d(file_path).to(DEVICE)
-                with torch.inference_mode():
-                    logits = unet3d_model(tensor)
-                    probs = torch.softmax(logits, dim=1)[0, 1]
-                lesion_score = float(probs.mean().cpu().item())
+                tensor = _volume_transform_3d(file_path)
+                tensor = tensor.repeat(1, 4, 1, 1, 1) # Expand to 4 channels
+                ort_inputs = {"input": tensor.numpy().astype(np.float32)}
+                logits = segresnet_session.run(["output"], ort_inputs)[0] # [1, 3, 96, 96, 96]
+                
+                probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+                tumor_mask = probs[0, 1] # Tumor core channel
+                
+                lesion_score = float(np.clip(tumor_mask.mean() * 15.0, 0, 1))
+                dynamic_bbox = extract_bboxes_from_mask(tumor_mask, threshold=0.1)
+                if dynamic_bbox:
+                    bbox = dynamic_bbox
+                
                 pred_map = _build_unet_predictions("CT", lesion_score)
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "MONAI 3D UNet (clinical weights)" if UNET_CLINICAL else "MONAI 3D UNet (demo weights)"
-                print(f"✓ UNet CT inference: {pathology} ({confidence:.2%})")
+                model_info = "MONAI SegResNet (ONNX Edge Optimized)"
+                print(f"✓ SegResNet CT inference: {pathology} ({confidence:.2%})")
             except Exception as e:
-                print(f"⚠ CT UNet inference failed, using ResNet/fallback: {e}")
+                print(f"⚠ CT SegResNet inference failed, using ResNet/fallback: {e}")
 
         if not pytorch_success and RESNET_AVAILABLE:
             try:
@@ -387,27 +417,37 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
             "Hepatic Lesion": {"x": 52, "y": 28, "w": 22, "h": 20, "label": "Hepatic Lesion"},
             "Appendicitis":   {"x": 42, "y": 66, "w": 16, "h": 14, "label": "Inflamed Appendix"},
         }
-        bbox = bbox_map.get(pathology)
+        if bbox is None:
+            bbox = bbox_map.get(pathology)
 
     # ── MRI: ResNet-50 + MONAI transforms ────────────────────────────────────
     else:
         pathologies = ["Glioblastoma", "Meningioma", "Ischemic Stroke", "Normal"]
 
-        if UNET_AVAILABLE:
+        bbox = None
+        if UNET_AVAILABLE and segresnet_session is not None:
             try:
-                tensor = _volume_transform_3d(file_path).to(DEVICE)
-                with torch.inference_mode():
-                    logits = unet3d_model(tensor)
-                    probs = torch.softmax(logits, dim=1)[0, 1]
-                lesion_score = float(probs.mean().cpu().item())
+                tensor = _volume_transform_3d(file_path)
+                tensor = tensor.repeat(1, 4, 1, 1, 1) # Expand to 4 channels
+                ort_inputs = {"input": tensor.numpy().astype(np.float32)}
+                logits = segresnet_session.run(["output"], ort_inputs)[0] # [1, 3, 96, 96, 96]
+                
+                probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+                tumor_mask = probs[0, 1] # Tumor core channel
+                
+                lesion_score = float(np.clip(tumor_mask.mean() * 15.0, 0, 1))
+                dynamic_bbox = extract_bboxes_from_mask(tumor_mask, threshold=0.1)
+                if dynamic_bbox:
+                    bbox = dynamic_bbox
+                
                 pred_map = _build_unet_predictions("MRI", lesion_score)
                 pathology = max(pred_map, key=pred_map.get)
                 confidence = float(pred_map[pathology])
                 pytorch_success = True
-                model_info = "MONAI 3D UNet (clinical weights)" if UNET_CLINICAL else "MONAI 3D UNet (demo weights)"
-                print(f"✓ UNet MRI inference: {pathology} ({confidence:.2%})")
+                model_info = "MONAI SegResNet (ONNX Edge Optimized)"
+                print(f"✓ SegResNet MRI inference: {pathology} ({confidence:.2%})")
             except Exception as e:
-                print(f"⚠ MRI UNet inference failed, using ResNet/fallback: {e}")
+                print(f"⚠ MRI SegResNet inference failed, using ResNet/fallback: {e}")
 
         if not pytorch_success and RESNET_AVAILABLE:
             try:
@@ -439,7 +479,8 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
             "Meningioma":     {"x": 28, "y": 48, "w": 18, "h": 18, "label": "Meningioma"},
             "Ischemic Stroke":{"x": 50, "y": 38, "w": 22, "h": 18, "label": "Infarct Zone"},
         }
-        bbox = bbox_map.get(pathology)
+        if bbox is None:
+            bbox = bbox_map.get(pathology)
 
     return {
         "pathology_detected": pathology,

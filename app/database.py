@@ -4,9 +4,12 @@ from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = "sqlite:///neuron_clinic.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://neuron_user:password@localhost:5432/neuron_db")
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# Only use check_same_thread for SQLite fallback
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -24,6 +27,11 @@ class Scan(Base):
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     inference_latency = Column(Float, default=0.0)         # Latency in ms
     pytorch_executed = Column(String, default="false")
+    status = Column(String, default="pending")             # pending, completed, failed
+    img_base64 = Column(String, nullable=True)             # Visualization mask
+    predictions = Column(String, nullable=True)            # JSON string of class probs
+    bbox = Column(String, nullable=True)                   # JSON string of bounding box
+    s3_url = Column(String, nullable=True)                 # Cloud storage link
 
 
 class ClinicSettings(Base):
@@ -66,26 +74,34 @@ def get_db():
 
 # ── Write Operations ──────────────────────────────────────────────────────────
 
-def log_scan(
-    db, patient_hash: str, scan_type: str, pathology_detected: str,
-    confidence_score: float, inference_latency: float, pytorch_executed: bool = False
-):
-    """
-    Saves a diagnostic scan record with latency telemetry for SOTA model evaluation.
-    """
+def create_pending_scan(db, patient_hash: str, scan_type: str, s3_url: str):
     scan = Scan(
         patient_hash=patient_hash,
         scan_type=scan_type,
-        pathology_detected=pathology_detected,
-        confidence_score=confidence_score,
-        inference_latency=inference_latency,
-        timestamp=datetime.now(timezone.utc),
-        pytorch_executed=str(pytorch_executed).lower(),
+        pathology_detected="Pending",
+        confidence_score=0.0,
+        s3_url=s3_url,
+        status="pending",
+        timestamp=datetime.now(timezone.utc)
     )
     db.add(scan)
     db.commit()
     db.refresh(scan)
     return scan
+
+
+def update_scan_result(db, scan_id: str, pathology: str, confidence: float, latency: float, pytorch_exec: bool, img_base64: str, predictions: str, bbox: str):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if scan:
+        scan.pathology_detected = pathology
+        scan.confidence_score = confidence
+        scan.inference_latency = latency
+        scan.pytorch_executed = str(pytorch_exec).lower()
+        scan.img_base64 = img_base64
+        scan.predictions = predictions
+        scan.bbox = bbox
+        scan.status = "completed"
+        db.commit()
 
 
 def update_clinic_setting(db, key: str, value: str):
