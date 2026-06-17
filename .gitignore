@@ -8,3 +8,8 @@ frontend/dist/
 frontend/node_modules/
 .env
 temp_uploads/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3

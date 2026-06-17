@@ -11,9 +11,14 @@ import torch
 import boto3
 from botocore.exceptions import NoCredentialsError
 
-CLINIC_SALT = os.environ.get("NEURON_CLINIC_SALT", "neuron_secure_salt_2026")
+CLINIC_SALT = os.environ.get("NEURON_CLINIC_SALT")
+if not CLINIC_SALT:
+    print("⚠️ WARNING: NEURON_CLINIC_SALT is not set. Falling back to an insecure default salt. Patient hashes may not be consistent across environments.")
+    CLINIC_SALT = "neuron_secure_salt_2026_fallback"
+
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "neuron-clinical-scans")
 S3_REGION = os.environ.get("S3_REGION", "ap-south-1")
+
 
 def upload_to_s3(file_content: bytes, filename: str) -> str:
     """

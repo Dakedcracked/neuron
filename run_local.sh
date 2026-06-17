@@ -34,10 +34,40 @@ echo "✓ All dependencies installed successfully."
 # 5. Ensure directories exist
 mkdir -p temp_uploads static models mock_s3_bucket
 
-# 6. Set default environment variables
-export DATABASE_URL=${DATABASE_URL:-"sqlite:///neuron_clinic.db"}
-export REDIS_URL=${REDIS_URL:-"redis://localhost:6379/0"}
-export MOCK_S3=${MOCK_S3:-"true"}
+# 6. Initialize local .env if it does not exist
+if [ ! -f .env ]; then
+    echo "📝 Creating local .env from .env.example..."
+    cp .env.example .env
+    
+    # Generate random keys using active python
+    export RAND_JWT_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+    export RAND_SALT=$(python -c "import secrets; print(secrets.token_hex(16))")
+    
+    python -c "
+import os
+with open('.env', 'r') as f:
+    content = f.read()
+content = content.replace('NEURON_SECRET_KEY=', 'NEURON_SECRET_KEY=' + os.environ['RAND_JWT_KEY'])
+content = content.replace('NEURON_CLINIC_SALT=', 'NEURON_CLINIC_SALT=' + os.environ['RAND_SALT'])
+with open('.env', 'w') as f:
+    f.write(content)
+"
+    echo "✓ Generated secure random NEURON_SECRET_KEY and NEURON_CLINIC_SALT in .env."
+    # Clean up temporary export variables
+    unset RAND_JWT_KEY
+    unset RAND_SALT
+fi
+
+
+# 7. Load environment variables from .env
+echo "🔌 Loading environment variables from .env..."
+while IFS= read -r line || [ -n "$line" ]; do
+    # Strip carriage returns and ignore comments / empty lines
+    line=$(echo "$line" | tr -d '\r')
+    if [[ ! "$line" =~ ^# ]] && [[ -n "$line" ]]; then
+        export "$line"
+    fi
+done < .env
 
 # 7. Start Celery worker in the background
 echo "🐝 Starting Celery background worker..."
