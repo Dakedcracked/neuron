@@ -65,15 +65,28 @@ with open('.env', 'w') as f:
 fi
 
 
-# 7. Load environment variables from .env
-echo "🔌 Loading environment variables from .env..."
-while IFS= read -r line || [ -n "$line" ]; do
-    # Strip carriage returns and ignore comments / empty lines
-    line=$(echo "$line" | tr -d '\r')
-    if [[ ! "$line" =~ ^# ]] && [[ -n "$line" ]]; then
-        export "$line"
-    fi
-done < .env
+# 7. Load environment variables securely from .env
+echo "🔌 Loading environment variables from .env securely..."
+if [ -f .env ]; then
+    eval $(python3 -c "
+import os
+with open('.env') as f:
+    for line in f:
+        line = line.strip()
+        if line and not line.startswith('#'):
+            parts = line.split('=', 1)
+            if len(parts) == 2:
+                k, v = parts
+                k = k.strip()
+                v = v.strip()
+                # Strip quotes if present
+                if (v.startswith('\"') and v.endswith('\"')) or (v.startswith('\'') and v.endswith('\'')):
+                    v = v[1:-1]
+                # Escape single quotes for safe shell export
+                v_esc = v.replace(\"'\", \"'\\\"'\\\"'\")
+                print(f\"export {k}='{v_esc}'\")
+")
+fi
 
 # 7.5. Run Pre-flight Diagnostics
 echo "🔍 Running pre-flight diagnostics..."
