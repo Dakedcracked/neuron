@@ -278,10 +278,28 @@ def _build_unet_predictions(modality: str, lesion_score: float) -> dict:
 def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
     """
     Runs AI inference on a medical scan file.
-    - XRAY: torchxrayvision DenseNet121 (real pretrained weights)
-    - CT/MRI: MONAI 3D UNet / ResNet-50 (requires clinical weights)
-    - Fallback: Inconclusive if no validated model is available
+    - Router: Attempts to call the standalone Inference Server (dynamic batching) first.
+    - Fallback: Runs local in-process inference if the server is unreachable.
     """
+    import urllib.request
+    import urllib.parse
+    import json
+    
+    server_url = os.environ.get("NEURON_INFERENCE_SERVER_URL", "http://127.0.0.1:8001/predict")
+    try:
+        post_data = urllib.parse.urlencode({
+            "file_path": file_path,
+            "modality": modality,
+            "patient_hash": patient_hash
+        }).encode('utf-8')
+        req = urllib.request.Request(server_url, data=post_data, method="POST")
+        # Set short timeout to quickly trigger local fallback if server is down
+        with urllib.request.urlopen(req, timeout=10.0) as response:
+            res_body = response.read().decode('utf-8')
+            return json.loads(res_body)
+    except Exception as e:
+        print(f"⚠ [Router] Inference Server unreachable at {server_url} ({e}). Falling back to local in-process execution.")
+
     pytorch_success = False
     model_info = f"{INCONCLUSIVE_LABEL} (no validated model available)"
 

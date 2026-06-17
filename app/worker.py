@@ -17,26 +17,39 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
     
     # 1. Download file from S3 to an ephemeral tempfile
     fd, temp_path = tempfile.mkstemp()
+    filename = s3_url.split("/")[-1]
+    file_content = None
     with os.fdopen(fd, 'wb') as f:
         if s3_url.startswith("s3://") and "mock" in s3_url:
             print("⚠ Mock S3 URL detected. Reading from local mock_s3_bucket.")
-            filename = s3_url.split("/")[-1]
             local_path = os.path.join(os.getcwd(), "mock_s3_bucket", filename)
             if not os.path.exists(local_path):
                 print(f"Failed to find local mock file: {local_path}")
                 os.remove(temp_path)
                 return False
             with open(local_path, "rb") as mock_f:
-                f.write(mock_f.read())
+                file_content = mock_f.read()
+                f.write(file_content)
         else:
             try:
                 req = urllib.request.Request(s3_url)
                 with urllib.request.urlopen(req) as response:
-                    f.write(response.read())
+                    file_content = response.read()
+                    f.write(file_content)
             except Exception as e:
                 print(f"⚠ [Celery] Failed to download scan from S3: {e}")
                 os.remove(temp_path)
                 return False
+
+    # Extract img_base64 preview from the downloaded file
+    from app.utils import preprocess_medical_file
+    img_base64 = None
+    try:
+        if file_content:
+            prepped = preprocess_medical_file(file_content, filename)
+            img_base64 = prepped.get("img_base64")
+    except Exception as e:
+        print(f"⚠ [Celery] Preprocessing/base64 extraction failed: {e}")
 
     # 2. Execute Heavy ONNX Inference
     try:
@@ -69,7 +82,7 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
             confidence=inference_out["confidence_score"],
             latency=latency,
             pytorch_exec=inference_out["pytorch_executed"],
-            img_base64=None, # Already saved by the FastAPI ingestion endpoint
+            img_base64=img_base64,
             predictions=json.dumps(inference_out["predictions"]) if inference_out["predictions"] else None,
             bbox=json.dumps(inference_out["bbox"]) if inference_out["bbox"] else None
         )

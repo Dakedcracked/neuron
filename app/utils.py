@@ -43,6 +43,35 @@ def upload_to_s3(file_content: bytes, filename: str) -> str:
         return f"s3://{S3_BUCKET}/failed_upload/{filename}"
 
 
+def generate_presigned_upload_url(filename: str, expiration=3600) -> dict:
+    """
+    Generates a presigned URL/POST payload to upload a file directly to S3.
+    """
+    if os.environ.get("MOCK_S3", "true").lower() == "true":
+        return {
+            "url": "http://127.0.0.1:8000/api/mock-upload",
+            "fields": {"key": filename},
+            "mock": True
+        }
+        
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+        region_name=S3_REGION
+    )
+    try:
+        response = s3_client.generate_presigned_post(
+            Bucket=S3_BUCKET,
+            Key=filename,
+            ExpiresIn=expiration
+        )
+        return response
+    except Exception as e:
+        print(f"Error generating presigned post URL: {e}")
+        return {}
+
+
 def anonymize_patient(patient_id: str, patient_name: str) -> str:
     """
     Complies with India's Digital Personal Data Protection (DPDP) Act.

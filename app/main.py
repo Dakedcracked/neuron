@@ -13,7 +13,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.database import init_db, get_db, create_pending_scan, get_dashboard_metrics, get_scan_history, update_clinic_setting, get_clinic_settings, SessionLocal as AuthSession, Scan
-from app.utils import preprocess_medical_file
+from app.utils import preprocess_medical_file, generate_presigned_upload_url
 from app.inference import run_inference
 from app.worker import process_scan
 from app.auth import (
@@ -135,6 +135,74 @@ async def change_password(
         return {"status": "success", "message": "Password updated successfully."}
     finally:
         db.close()
+
+
+# ── Scaling Optimized S3/R2 Direct Uploads ────────────────────────────────────
+
+@app.post("/api/get-upload-url")
+async def get_upload_url(
+    filename: str = Form(...),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generates a presigned URL/POST payload for direct-to-S3 client uploading.
+    This eliminates server-side buffering of large scan payloads.
+    """
+    url_data = generate_presigned_upload_url(filename)
+    if not url_data:
+        raise HTTPException(status_code=500, detail="Failed to generate upload URL.")
+    return url_data
+
+
+@app.post("/api/mock-upload")
+async def mock_upload(file: UploadFile = File(...), key: str = Form(...)):
+    """
+    Simulates direct-to-S3 upload for local workstation testing.
+    Saves the payload to the local mock S3 bucket.
+    """
+    try:
+        mock_bucket = os.path.join(os.getcwd(), "mock_s3_bucket")
+        os.makedirs(mock_bucket, exist_ok=True)
+        local_path = os.path.join(mock_bucket, key)
+        content = await file.read()
+        with open(local_path, "wb") as f:
+            f.write(content)
+        return {"status": "success", "s3_url": f"s3://{os.environ.get('S3_BUCKET_NAME', 'neuron-clinical-scans')}/mock/{key}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/register-scan")
+async def register_scan(
+    s3_key: str = Form(...),
+    modality: str = Form(None),
+    patient_id: str = Form("ANON_ID"),
+    patient_name: str = Form("ANON_NAME"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Registers a direct-to-S3 uploaded scan, parses the record metadata,
+    and queues it for asynchronous Celery background processing.
+    """
+    from app.utils import anonymize_patient, S3_BUCKET
+    patient_hash = anonymize_patient(patient_id, patient_name)
+    s3_url = f"s3://{S3_BUCKET}/mock/{s3_key}" if os.environ.get("MOCK_S3", "true").lower() == "true" else f"https://{S3_BUCKET}.s3.{os.environ.get('S3_REGION', 'ap-south-1')}.amazonaws.com/{s3_key}"
+    
+    # Register scan in DB as pending
+    logged = create_pending_scan(db=db, patient_hash=patient_hash, scan_type=modality or "XRAY", s3_url=s3_url)
+    
+    # Dispatch non-blocking Celery task
+    process_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality or "XRAY", patient_hash=patient_hash)
+    
+    return {
+        "status": "pending",
+        "scan_id": logged.id,
+        "patient_hash": patient_hash,
+        "modality": modality or "XRAY",
+        "s3_url": s3_url,
+        "message": "Scan registered and queued for background inference.",
+    }
 
 
 # ── Scan Upload API ───────────────────────────────────────────────────────────
