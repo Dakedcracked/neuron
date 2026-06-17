@@ -34,7 +34,13 @@ echo "✓ All dependencies installed successfully."
 # 5. Ensure directories exist
 mkdir -p temp_uploads static models mock_s3_bucket
 
+# 5.5 Pre-cache model weights dynamically
+echo "⏳ Pre-checking and downloading model weights (this might take a few minutes on first run)..."
+python models/download_weights.py
+echo "✓ Model weights checked and ready."
+
 # 6. Initialize local .env if it does not exist
+
 if [ ! -f .env ]; then
     echo "📝 Creating local .env from .env.example..."
     cp .env.example .env

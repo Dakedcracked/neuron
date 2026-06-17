@@ -16,3 +16,8 @@ temp_uploads/
 dump.rdb
 *.rdb
 
+# Model weights
+models/*.pt
+models/*.onnx
+models/*.onnx.data
+
