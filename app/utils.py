@@ -1,3 +1,4 @@
+import os
 import hashlib
 import io
 import base64
@@ -96,10 +97,143 @@ def anonymize_patient(patient_id: str, patient_name: str) -> str:
     return f"PX-{hashed[:20].upper()}"
 
 
+def apply_hu_window(hu_array: np.ndarray, wc: float, ww: float) -> np.ndarray:
+    """Clips and normalizes raw Hounsfield Units to [0, 1] based on Window Center (WC) and Window Width (WW)."""
+    v_min = wc - ww / 2.0
+    v_max = wc + ww / 2.0
+    clipped = np.clip(hu_array, v_min, v_max)
+    if v_max - v_min > 0:
+        return (clipped - v_min) / (v_max - v_min)
+    else:
+        return np.zeros_like(clipped)
+
+
+def log_space_histogram_equalization(pixel_array: np.ndarray) -> np.ndarray:
+    """Optimized log-space contrast histogram equalization for X-Ray imaging."""
+    shifted = pixel_array - np.min(pixel_array)
+    log_transformed = np.log1p(shifted)
+    
+    flat = log_transformed.flatten()
+    f_min = flat.min()
+    f_max = flat.max()
+    if f_max - f_min > 0:
+        flat_norm = (flat - f_min) / (f_max - f_min)
+    else:
+        flat_norm = np.zeros_like(flat)
+    
+    hist, bins = np.histogram(flat_norm, bins=256, range=(0, 1))
+    cdf = hist.cumsum()
+    if cdf[-1] > 0:
+        cdf_normalized = cdf / cdf[-1]
+    else:
+        cdf_normalized = np.zeros_like(cdf)
+    
+    equalized_flat = np.interp(flat_norm, bins[:-1], cdf_normalized)
+    return equalized_flat.reshape(pixel_array.shape)
+
+
+def adaptive_z_score_normalization(pixel_array: np.ndarray) -> np.ndarray:
+    """Adaptive Z-score signal intensity normalization for MRI scans."""
+    threshold = np.mean(pixel_array) * 0.1
+    foreground = pixel_array[pixel_array > threshold]
+    if len(foreground) > 0:
+        mean = np.mean(foreground)
+        std = np.std(foreground)
+    else:
+        mean = np.mean(pixel_array)
+        std = np.std(pixel_array)
+        
+    if std > 1e-6:
+        z_scored = (pixel_array - mean) / std
+    else:
+        z_scored = pixel_array - mean
+        
+    clipped = np.clip(z_scored, -3.0, 3.0)
+    return (clipped + 3.0) / 6.0
+
+
+def build_multi_window_rgb(pixel_array: np.ndarray, modality: str) -> np.ndarray:
+    """
+    Converts a single-channel 2D or 3D slice array into an optimized 3-channel (RGB) composite array.
+    Shape returned: (3, H, W).
+    """
+    if len(pixel_array.shape) == 3:
+        if pixel_array.shape[2] < pixel_array.shape[0] and pixel_array.shape[2] < pixel_array.shape[1]:
+            mid_z = pixel_array.shape[2] // 2
+            slice_2d = pixel_array[:, :, mid_z]
+        else:
+            mid_z = pixel_array.shape[0] // 2
+            slice_2d = pixel_array[mid_z]
+    else:
+        slice_2d = pixel_array
+
+    if modality == "CT":
+        # Channel R (Soft Tissue): WC = 40, WW = 400
+        # Channel G (Lung/Air): WC = -600, WW = 1500
+        # Channel B (Bone): WC = 500, WW = 2000
+        r = apply_hu_window(slice_2d, 40.0, 400.0)
+        g = apply_hu_window(slice_2d, -600.0, 1500.0)
+        b = apply_hu_window(slice_2d, 500.0, 2000.0)
+    elif modality == "XRAY":
+        eq = log_space_histogram_equalization(slice_2d)
+        r = eq
+        g = eq
+        b = eq
+    elif modality == "MRI":
+        z = adaptive_z_score_normalization(slice_2d)
+        r = z
+        g = z
+        b = z
+    else:
+        p_min, p_max = slice_2d.min(), slice_2d.max()
+        if p_max - p_min > 0:
+            norm = (slice_2d - p_min) / (p_max - p_min)
+        else:
+            norm = np.zeros_like(slice_2d)
+        r = norm
+        g = norm
+        b = norm
+
+    return np.stack([r, g, b], axis=0)
+
+
+def convert_pixels_to_base64_png(pixel_array: np.ndarray) -> str:
+    """
+    Converts a normalized 2D numpy array [0, 1] to a base64 encoded PNG string.
+    Kept for legacy compatibility.
+    """
+    scaled = (pixel_array * 255.0).clip(0, 255).astype(np.uint8)
+    image = Image.fromarray(scaled).convert("L")
+
+    if max(image.size) > 1024:
+        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def convert_rgb_to_base64_png(rgb_array: np.ndarray) -> str:
+    """
+    Converts a normalized 3-channel RGB numpy array [3, H, W] in range [0, 1]
+    to a base64 encoded PNG string.
+    """
+    permuted = np.transpose(rgb_array, (1, 2, 0))
+    scaled = (permuted * 255.0).clip(0, 255).astype(np.uint8)
+    image = Image.fromarray(scaled).convert("RGB")
+
+    if max(image.size) > 1024:
+        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
 def parse_dicom(file_content: bytes) -> dict:
     """
     Parses raw DICOM bytes using pydicom. Extracts headers and returns metadata
-    and normalized pixel arrays.
+    and preserved raw Hounsfield Units (HU) inside multi-window RGB arrays.
     """
     dataset = pydicom.dcmread(io.BytesIO(file_content))
 
@@ -125,41 +259,25 @@ def parse_dicom(file_content: bytes) -> dict:
 
     pixel_array = dataset.pixel_array.astype(np.float32)
 
+    slope = 1.0
+    intercept = 0.0
     if hasattr(dataset, "RescaleSlope") and hasattr(dataset, "RescaleIntercept"):
         slope = float(dataset.RescaleSlope)
         intercept = float(dataset.RescaleIntercept)
         pixel_array = pixel_array * slope + intercept
 
-    p_min, p_max = pixel_array.min(), pixel_array.max()
-    if p_max - p_min > 0:
-        normalized_pixels = (pixel_array - p_min) / (p_max - p_min)
-    else:
-        normalized_pixels = np.zeros_like(pixel_array)
+    # Generate multi-window 3-channel RGB composite
+    rgb_composite = build_multi_window_rgb(pixel_array, modality)
 
     return {
         "patient_hash": patient_hash,
         "modality": modality,
-        "normalized_pixels": normalized_pixels,
+        "normalized_pixels": rgb_composite,
         "raw_pixels": pixel_array,
         "patient_age": getattr(dataset, "PatientAge", "N/A"),
         "patient_sex": getattr(dataset, "PatientSex", "N/A"),
         "study_description": getattr(dataset, "StudyDescription", "General Scan"),
     }
-
-
-def convert_pixels_to_base64_png(pixel_array: np.ndarray) -> str:
-    """
-    Converts a normalized 2D numpy array [0, 1] to a base64 encoded PNG string.
-    """
-    scaled = (pixel_array * 255.0).astype(np.uint8)
-    image = Image.fromarray(scaled).convert("L")
-
-    if max(image.size) > 1024:
-        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
@@ -168,7 +286,7 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
     Returns:
         - patient_hash (DPDP anonymized string)
         - modality (XRAY, CT, or MRI)
-        - tensor (PyTorch float tensor)
+        - tensor (PyTorch float tensor [1, 3, H, W])
         - img_base64 (visualization PNG base64 representation)
         - metadata (demographics and study details)
     """
@@ -176,8 +294,9 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
 
     if name_lower.endswith(".dcm"):
         dicom_data = parse_dicom(file_content)
-        tensor = torch.tensor(dicom_data["normalized_pixels"]).unsqueeze(0).unsqueeze(0)
-        img_base64 = convert_pixels_to_base64_png(dicom_data["normalized_pixels"])
+        rgb_arr = dicom_data["normalized_pixels"]
+        tensor = torch.tensor(rgb_arr).unsqueeze(0)
+        img_base64 = convert_rgb_to_base64_png(rgb_arr)
 
         return {
             "patient_hash": dicom_data["patient_hash"],
@@ -192,7 +311,6 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
         }
 
     elif name_lower.endswith(".nii") or name_lower.endswith(".nii.gz"):
-        # ✅ FIXED: Use system ephemeral tempfile instead of local directory
         temp_ext = ".nii.gz" if name_lower.endswith(".gz") else ".nii"
         import tempfile
         fd, temp_name = tempfile.mkstemp(suffix=temp_ext)
@@ -206,27 +324,19 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
             if os.path.exists(temp_name):
                 os.remove(temp_name)
 
-        shape = data.shape
-        if len(shape) >= 3:
-            mid_z = shape[2] // 2
-            slice_data = data[:, :, mid_z]
-            tensor = torch.tensor(data).unsqueeze(0).unsqueeze(0)
-        else:
-            slice_data = data
-            mid_z = 0
-            tensor = torch.tensor(data).unsqueeze(0).unsqueeze(0)
-
-        d_min, d_max = slice_data.min(), slice_data.max()
-        normalized_slice = (slice_data - d_min) / (d_max - d_min) if d_max - d_min > 0 else np.zeros_like(slice_data)
-
         modality = "MRI"
         if "ct" in name_lower or "abdominal" in name_lower:
             modality = "CT"
         elif "xray" in name_lower or "chest" in name_lower:
             modality = "XRAY"
 
+        rgb_arr = build_multi_window_rgb(data, modality)
+        tensor = torch.tensor(rgb_arr).unsqueeze(0)
+        img_base64 = convert_rgb_to_base64_png(rgb_arr)
         patient_hash = anonymize_patient("NII_ID", filename)
-        img_base64 = convert_pixels_to_base64_png(normalized_slice)
+
+        shape = data.shape
+        mid_z = shape[2] // 2 if len(shape) >= 3 else 0
         desc = f"NIfTI 3D Volume — Axial Slice {mid_z + 1}/{shape[2]}" if len(shape) >= 3 else "NIfTI 2D Volume"
 
         return {
@@ -239,7 +349,7 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
 
     else:
         img = Image.open(io.BytesIO(file_content)).convert("L")
-        img_np = np.array(img).astype(np.float32) / 255.0
+        img_np = np.array(img).astype(np.float32)
 
         modality = "XRAY"
         if "mri" in name_lower or "brain" in name_lower:
@@ -247,9 +357,10 @@ def preprocess_medical_file(file_content: bytes, filename: str) -> dict:
         elif "ct" in name_lower or "abdominal" in name_lower:
             modality = "CT"
 
+        rgb_arr = build_multi_window_rgb(img_np, modality)
+        tensor = torch.tensor(rgb_arr).unsqueeze(0)
+        img_base64 = convert_rgb_to_base64_png(rgb_arr)
         patient_hash = anonymize_patient("IMG_ID", filename)
-        tensor = torch.tensor(img_np).unsqueeze(0).unsqueeze(0)
-        img_base64 = convert_pixels_to_base64_png(img_np)
 
         return {
             "patient_hash": patient_hash,

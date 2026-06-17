@@ -72,6 +72,9 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
             os.remove(temp_path)
             
     # 3. Save Results to Database
+    if inference_out.get("img_base64"):
+        img_base64 = inference_out["img_base64"]
+        
     db = SessionLocal()
     try:
         update_scan_result(
