@@ -105,7 +105,14 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
         if os.path.exists(temp_path):
             os.remove(temp_path)
             
-    # 3. Save Results to Database
+    # 3. Detect Clinical Variance Triage & Determine Priority
+    scan_priority = "normal"
+    pathology_result = inference_out["pathology_detected"]
+    if "Discrepancy Triage" in pathology_result or "Inconclusive" in pathology_result:
+        scan_priority = "high"
+        print(f"🚨 [Celery] CLINICAL VARIANCE TRIAGE for Scan {scan_id}: '{pathology_result}' — elevating priority to HIGH.")
+
+    # 4. Save Results to Database
     if inference_out.get("img_base64"):
         img_base64 = inference_out["img_base64"]
         
@@ -114,15 +121,16 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
         update_scan_result(
             db=db,
             scan_id=scan_id,
-            pathology=inference_out["pathology_detected"],
+            pathology=pathology_result,
             confidence=inference_out["confidence_score"],
             latency=latency,
             pytorch_exec=inference_out["pytorch_executed"],
             img_base64=img_base64,
             predictions=json.dumps(inference_out["predictions"]) if inference_out["predictions"] else None,
-            bbox=json.dumps(inference_out["bbox"]) if inference_out["bbox"] else None
+            bbox=json.dumps(inference_out["bbox"]) if inference_out["bbox"] else None,
+            priority=scan_priority
         )
-        print(f"✓ [Celery] Inference complete for Scan {scan_id}")
+        print(f"✓ [Celery] Inference complete for Scan {scan_id} (priority={scan_priority})")
     except Exception as e:
         print(f"⚠ [Celery] Failed to save DB results: {e}")
     finally:

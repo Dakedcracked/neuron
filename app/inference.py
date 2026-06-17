@@ -334,30 +334,9 @@ def run_medsam_segmentation(file_path: str, bbox_prompt: dict = None) -> np.ndar
         except Exception as e:
             print(f"⚠ SegResNet fallback segmenter failed: {e}")
             
-    # Secondary fallback: generate simulated high-precision elliptical mask
-    # We create a realistic lesion boundary depending on the modality/file path name
-    mask = np.zeros((h_orig, w_orig), dtype=np.float32)
-    path_lower = file_path.lower()
-    
-    if "stroke" in path_lower or "mri" in path_lower:
-        cy, cx = h_orig // 2, w_orig // 2 - 20
-        ry, rx = 28, 35
-    elif "renal" in path_lower or "calculi" in path_lower or "ct" in path_lower:
-        cy, cx = h_orig // 2 + 30, w_orig // 2 - 40
-        ry, rx = 12, 12
-    else:
-        cy, cx = h_orig // 2, w_orig // 2
-        ry, rx = 20, 20
-        
-    y, x = np.ogrid[:h_orig, :w_orig]
-    dist = ((y - cy) / ry) ** 2 + ((x - cx) / rx) ** 2
-    mask[dist <= 1.0] = 1.0
-    
-    border = (dist > 0.8) & (dist <= 1.2)
-    noise = np.random.randn(*mask.shape) * 0.1
-    mask[border] = (mask[border] + noise[border]) > 0.5
-    
-    return mask.astype(np.float32)
+    # No model available — return None so callers can handle gracefully
+    print("⚠ No segmentation model available (MedSAM/SegResNet both unavailable). Returning empty mask.")
+    return None
 
 
 def _xray_transform(file_path: str) -> torch.Tensor:
@@ -720,12 +699,12 @@ def _execute_triton_inference(np_arr: np.ndarray, model_name: str, input_name: s
     return response.as_numpy(output_name)
 
 
-def _local_nn_forward_xray(tensor: torch.Tensor) -> torch.Tensor:
+def _local_nn_forward_xray(model: torch.nn.Module, tensor: torch.Tensor) -> torch.Tensor:
     """Runs local in-process DenseNet121 model execution (FP16 if CUDA active)."""
     with torch.inference_mode():
         if DEVICE.type == "cuda":
             tensor = tensor.half()
-        return xrv_model(tensor)
+        return model(tensor)
 
 
 def _local_nn_forward_resnet(model: torch.nn.Module, tensor: torch.Tensor) -> torch.Tensor:
@@ -1013,7 +992,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                     max_variance = max(std_probs.values())
                     if max_variance > 0.15:
                         print(f"🚨 CLINICAL DISCREPANCY DETECTED: Max XRAY fold variance {max_variance:.4f} exceeds threshold 0.15. Triggering safety override.")
-                        pathology = "Inconclusive (Requires Specialist Verification)"
+                        pathology = "Inconclusive (Discrepancy Triage)"
                         confidence = 0.0
                         pred_map = mean_probs
                     else:
@@ -1054,7 +1033,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                     max_variance = max(std_probs.values())
                     if max_variance > 0.15:
                         print(f"🚨 CLINICAL DISCREPANCY DETECTED: Max CT fold variance {max_variance:.4f} exceeds threshold 0.15. Triggering safety override.")
-                        pathology = "Inconclusive (Requires Specialist Verification)"
+                        pathology = "Inconclusive (Discrepancy Triage)"
                         confidence = 0.0
                         pred_map = mean_probs
                     else:
@@ -1114,7 +1093,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                     max_variance = max(std_probs.values())
                     if max_variance > 0.15:
                         print(f"🚨 CLINICAL DISCREPANCY DETECTED: Max MRI fold variance {max_variance:.4f} exceeds threshold 0.15. Triggering safety override.")
-                        pathology = "Inconclusive (Requires Specialist Verification)"
+                        pathology = "Inconclusive (Discrepancy Triage)"
                         confidence = 0.0
                         pred_map = mean_probs
                     else:
@@ -1151,7 +1130,7 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
     bbox = None
     
     # If the prediction logic successfully completed:
-    if pytorch_success and pathology not in ("Normal", INCONCLUSIVE_LABEL, "Inconclusive (Requires Specialist Verification)"):
+    if pytorch_success and pathology not in ("Normal", INCONCLUSIVE_LABEL, "Inconclusive (Discrepancy Triage)"):
         
         # ── MedSAM Segmentation & BBox Routing (CT/MRI) ───────────────────────
         if modality in ("CT", "MRI"):
@@ -1289,7 +1268,8 @@ def run_inference(file_path: str, modality: str, patient_hash: str) -> dict:
                         heatmap_raw = _reconstruct_cam_from_activations(triton_activations, weights)
                     else:
                         tensor = _xray_transform(file_path).to(DEVICE)
-                        gradcam = GradCAM(xrv_model, xrv_model.features.norm5)
+                        target_layer = getattr(xrv_model.features, 'norm5', None) or list(xrv_model.features.children())[-1]
+                        gradcam = GradCAM(xrv_model, target_layer)
                         heatmap_raw = gradcam.generate_heatmap(tensor, target_class_idx)
                     
                     heatmap = _resize_heatmap(heatmap_raw, (h_orig, w_orig))

@@ -33,6 +33,7 @@ class Scan(Base):
     img_base64 = Column(String, nullable=True)             # Visualization mask
     predictions = Column(String, nullable=True)            # JSON string of class probs
     bbox = Column(String, nullable=True)                   # JSON string of bounding box
+    priority = Column(String, default="normal")             # normal, high, critical
     s3_url = Column(String, nullable=True)                 # Cloud storage link
 
 
@@ -89,7 +90,7 @@ def create_pending_scan(db, patient_hash: str, scan_type: str, s3_url: str):
     return scan
 
 
-def update_scan_result(db, scan_id: str, pathology: str, confidence: float, latency: float, pytorch_exec: bool, img_base64: str, predictions: str, bbox: str):
+def update_scan_result(db, scan_id: str, pathology: str, confidence: float, latency: float, pytorch_exec: bool, img_base64: str, predictions: str, bbox: str, priority: str = "normal"):
     scan = db.query(Scan).filter(Scan.id == scan_id).first()
     if scan:
         scan.pathology_detected = pathology
@@ -99,7 +100,8 @@ def update_scan_result(db, scan_id: str, pathology: str, confidence: float, late
         scan.img_base64 = img_base64
         scan.predictions = predictions
         scan.bbox = bbox
-        scan.status = "completed"
+        scan.priority = priority
+        scan.status = "triage" if priority in ("high", "critical") else "completed"
         db.commit()
 
 

@@ -25,3 +25,5 @@ redis>=4.6.0
 SimpleITK>=2.3.0
 python-dotenv>=1.0.0
 tritonclient[http]>=2.34.0
+scipy>=1.11.0
+opencv-python-headless>=4.8.0
