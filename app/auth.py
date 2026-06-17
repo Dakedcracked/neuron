@@ -38,6 +38,7 @@ class User(Base):
     role = Column(String, default="radiologist")  # radiologist | admin
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    tenant_id = Column(String, nullable=True, index=True)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ def seed_default_admin(db: Session):
             hashed_password=hash_password(NEURON_ADMIN_PASSWORD),
             role="admin",
             is_active=True,
+            tenant_id="default-tenant-uuid",
         )
         db.add(admin)
         db.commit()

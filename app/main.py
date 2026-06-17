@@ -15,7 +15,7 @@ from slowapi.errors import RateLimitExceeded
 from app.database import init_db, get_db, create_pending_scan, get_dashboard_metrics, get_scan_history, update_clinic_setting, get_clinic_settings, SessionLocal as AuthSession, Scan
 from app.utils import preprocess_medical_file, generate_presigned_upload_url
 from app.inference import run_inference
-from app.worker import process_scan
+from app.worker import process_scan, process_triage_scan
 from app.auth import (
     User, seed_default_admin, get_current_user, get_admin_user,
     verify_password, hash_password, create_access_token,
@@ -176,6 +176,7 @@ async def register_scan(
     modality: str = Form(None),
     patient_id: str = Form("ANON_ID"),
     patient_name: str = Form("ANON_NAME"),
+    priority: str = Form("normal"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -188,10 +189,13 @@ async def register_scan(
     s3_url = f"s3://{S3_BUCKET}/mock/{s3_key}" if os.environ.get("MOCK_S3", "true").lower() == "true" else f"https://{S3_BUCKET}.s3.{os.environ.get('S3_REGION', 'ap-south-1')}.amazonaws.com/{s3_key}"
     
     # Register scan in DB as pending
-    logged = create_pending_scan(db=db, patient_hash=patient_hash, scan_type=modality or "XRAY", s3_url=s3_url)
+    logged = create_pending_scan(db=db, patient_hash=patient_hash, scan_type=modality or "XRAY", s3_url=s3_url, tenant_id=current_user.tenant_id)
     
-    # Dispatch non-blocking Celery task
-    process_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality or "XRAY", patient_hash=patient_hash)
+    # Dispatch non-blocking Celery task based on priority
+    if priority.lower() in ("high", "critical"):
+        process_triage_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality or "XRAY", patient_hash=patient_hash)
+    else:
+        process_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality or "XRAY", patient_hash=patient_hash)
     
     return {
         "status": "pending",
@@ -199,6 +203,7 @@ async def register_scan(
         "patient_hash": patient_hash,
         "modality": modality or "XRAY",
         "s3_url": s3_url,
+        "priority": priority,
         "message": "Scan registered and queued for background inference.",
     }
 
@@ -211,6 +216,7 @@ async def upload_scan(
     request: Request,
     file: UploadFile = File(...),
     modality: str = Form(None),
+    priority: str = Form("normal"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -229,6 +235,14 @@ async def upload_scan(
 
     try:
         content = await file.read()
+        
+        # Execute Pre-Inference Safety Rails Validation
+        from app.safety_rails import run_pre_inference_validation, SafetyRailException
+        try:
+            run_pre_inference_validation(content, filename)
+        except SafetyRailException as se:
+            raise HTTPException(status_code=400, detail=f"Safety Rail Validation Failed: {str(se)}")
+            
         prepped = preprocess_medical_file(content, filename)
 
         patient_hash = prepped["patient_hash"]
@@ -247,12 +261,15 @@ async def upload_scan(
         s3_url = upload_to_s3(content, filename)
 
         # 2. Register the scan in the DB as "Pending"
-        logged = create_pending_scan(db=db, patient_hash=patient_hash, scan_type=modality, s3_url=s3_url)
+        logged = create_pending_scan(db=db, patient_hash=patient_hash, scan_type=modality, s3_url=s3_url, tenant_id=current_user.tenant_id)
         logged.img_base64 = img_base64
         db.commit()
 
-        # 3. Dispatch the Celery task (non-blocking)
-        process_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality, patient_hash=patient_hash)
+        # 3. Dispatch the Celery task (non-blocking) based on priority
+        if priority.lower() in ("high", "critical"):
+            process_triage_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality, patient_hash=patient_hash)
+        else:
+            process_scan.delay(scan_id=logged.id, s3_url=s3_url, modality=modality, patient_hash=patient_hash)
 
         return {
             "status": "pending",
@@ -261,6 +278,7 @@ async def upload_scan(
             "modality": modality,
             "metadata": metadata,
             "img_base64": img_base64,
+            "priority": priority,
             "timestamp": logged.timestamp.strftime("%Y-%m-%d %H:%M:%S") if logged.timestamp else None,
             "message": "Scan uploaded and queued for background inference.",
         }
@@ -280,7 +298,7 @@ async def dashboard_metrics(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        return get_dashboard_metrics(db)
+        return get_dashboard_metrics(db, tenant_id=current_user.tenant_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query telemetry: {str(e)}")
 
@@ -293,7 +311,7 @@ async def get_scan_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    scan = db.query(Scan).filter(Scan.id == scan_id, Scan.tenant_id == current_user.tenant_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     
@@ -321,7 +339,7 @@ async def scan_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return get_scan_history(db, page=page, page_size=size, scan_type=scan_type, pathology=pathology)
+    return get_scan_history(db, page=page, page_size=size, scan_type=scan_type, pathology=pathology, tenant_id=current_user.tenant_id)
 
 
 # ── Settings API ──────────────────────────────────────────────────────────────

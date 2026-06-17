@@ -6,19 +6,40 @@ from celery import Celery
 from app.inference import run_inference
 from app.database import SessionLocal, update_scan_result, Scan
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+# Retrieve settings
+USE_RABBITMQ = os.environ.get("USE_RABBITMQ", "false").lower() == "true"
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672//")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 
-celery_app = Celery("neuron_worker", broker=REDIS_URL, backend=REDIS_URL)
+BROKER_URL = RABBITMQ_URL if USE_RABBITMQ else REDIS_URL
 
-# Configure Celery process isolation to entirely neutralize PyTorch/MONAI memory leaks
+celery_app = Celery("neuron_worker", broker=BROKER_URL, backend=REDIS_URL)
+
+from kombu import Queue
+
+# Configure Celery process isolation and routing
 celery_app.conf.update(
+    task_default_queue='scans.standard',
+    task_queues=(
+        Queue('scans.standard', routing_key='scans.standard'),
+        Queue('scans.triage', routing_key='scans.triage'),
+    ),
+    task_routes={
+        'process_scan': {
+            'queue': 'scans.standard',
+            'routing_key': 'scans.standard',
+        },
+        'process_triage_scan': {
+            'queue': 'scans.triage',
+            'routing_key': 'scans.triage',
+        },
+    },
     worker_max_tasks_per_child=50,
     worker_prefetch_multiplier=1
 )
 
-@celery_app.task(name="process_scan")
-def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
-    print(f"⏳ [Celery] Starting background inference for Scan {scan_id}")
+def _execute_process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str, default_priority: str = "normal"):
+    print(f"⏳ [Celery] Starting background inference for Scan {scan_id} (default_priority={default_priority})")
     
     # 1. Download file from S3/R2 directly via boto3 streams to an ephemeral tempfile
     fd, temp_path = tempfile.mkstemp()
@@ -106,7 +127,7 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
             os.remove(temp_path)
             
     # 3. Detect Clinical Variance Triage & Determine Priority
-    scan_priority = "normal"
+    scan_priority = default_priority
     pathology_result = inference_out["pathology_detected"]
     if "Discrepancy Triage" in pathology_result or "Inconclusive" in pathology_result:
         scan_priority = "high"
@@ -137,3 +158,14 @@ def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
         db.close()
         
     return True
+
+
+@celery_app.task(name="process_scan")
+def process_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
+    return _execute_process_scan(scan_id, s3_url, modality, patient_hash, default_priority="normal")
+
+
+@celery_app.task(name="process_triage_scan")
+def process_triage_scan(scan_id: str, s3_url: str, modality: str, patient_hash: str):
+    return _execute_process_scan(scan_id, s3_url, modality, patient_hash, default_priority="high")
+

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, func
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, func, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker
 from app.config import DATABASE_URL
 
@@ -17,6 +17,14 @@ Base = declarative_base()
 
 
 # ── ORM Models ────────────────────────────────────────────────────────────────
+
+class ClinicTenant(Base):
+    __tablename__ = "clinic_tenants"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
 
 class Scan(Base):
     __tablename__ = "scans"
@@ -35,6 +43,7 @@ class Scan(Base):
     bbox = Column(String, nullable=True)                   # JSON string of bounding box
     priority = Column(String, default="normal")             # normal, high, critical
     s3_url = Column(String, nullable=True)                 # Cloud storage link
+    tenant_id = Column(String, ForeignKey("clinic_tenants.id"), nullable=True, index=True)
 
 
 class ClinicSettings(Base):
@@ -54,6 +63,17 @@ def init_db():
 def _seed_default_settings():
     db = SessionLocal()
     try:
+      # Seed default tenant
+      default_tenant = db.query(ClinicTenant).filter_by(name="Default National Clinic").first()
+      if not default_tenant:
+          default_tenant = ClinicTenant(id="default-tenant-uuid", name="Default National Clinic")
+          db.add(default_tenant)
+          db.commit()
+          
+          # Associate any orphaned scans to the default tenant
+          db.query(Scan).filter(Scan.tenant_id == None).update({Scan.tenant_id: "default-tenant-uuid"})
+          db.commit()
+
       defaults = {
           "clinic_name": "Neuron AI Diagnostic Centre",
           "station_id": "B2B-HYD-94",
@@ -74,7 +94,7 @@ def get_db():
 
 # ── Write Operations ──────────────────────────────────────────────────────────
 
-def create_pending_scan(db, patient_hash: str, scan_type: str, s3_url: str):
+def create_pending_scan(db, patient_hash: str, scan_type: str, s3_url: str, tenant_id: str = None):
     scan = Scan(
         patient_hash=patient_hash,
         scan_type=scan_type,
@@ -82,7 +102,8 @@ def create_pending_scan(db, patient_hash: str, scan_type: str, s3_url: str):
         confidence_score=0.0,
         s3_url=s3_url,
         status="pending",
-        timestamp=datetime.now(timezone.utc)
+        timestamp=datetime.now(timezone.utc),
+        tenant_id=tenant_id
     )
     db.add(scan)
     db.commit()
@@ -122,14 +143,17 @@ def get_clinic_settings(db) -> dict:
 
 # ── Read Operations ───────────────────────────────────────────────────────────
 
-def get_scan_history(db, page: int = 1, page_size: int = 20, scan_type: str = None, pathology: str = None):
+def get_scan_history(db, page: int = 1, page_size: int = 20, scan_type: str = None, pathology: str = None, tenant_id: str = None):
     """Paginated scan history with latency statistics for accuracy auditing."""
-    query = db.query(Scan).order_by(Scan.timestamp.desc())
+    query = db.query(Scan)
+    if tenant_id:
+        query = query.filter(Scan.tenant_id == tenant_id)
     if scan_type:
         query = query.filter(Scan.scan_type == scan_type.upper())
     if pathology:
         query = query.filter(Scan.pathology_detected.ilike(f"%{pathology}%"))
 
+    query = query.order_by(Scan.timestamp.desc())
     total = query.count()
     scans = query.offset((page - 1) * page_size).limit(page_size).all()
 
@@ -154,30 +178,53 @@ def get_scan_history(db, page: int = 1, page_size: int = 20, scan_type: str = No
     }
 
 
-def get_dashboard_metrics(db):
-    total_scans = db.query(func.count(Scan.id)).scalar() or 0
+def get_dashboard_metrics(db, tenant_id: str = None):
+    total_scans_query = db.query(func.count(Scan.id))
+    if tenant_id:
+        total_scans_query = total_scans_query.filter(Scan.tenant_id == tenant_id)
+    total_scans = total_scans_query.scalar() or 0
 
     # Scan counts per modality
-    modality_counts = db.query(Scan.scan_type, func.count(Scan.id)).group_by(Scan.scan_type).all()
+    modality_counts_query = db.query(Scan.scan_type, func.count(Scan.id))
+    if tenant_id:
+        modality_counts_query = modality_counts_query.filter(Scan.tenant_id == tenant_id)
+    modality_counts = modality_counts_query.group_by(Scan.scan_type).all()
     modality_map = {row[0]: row[1] for row in modality_counts}
 
     # Average latency per modality for model optimization audits
-    modality_latencies = db.query(Scan.scan_type, func.avg(Scan.inference_latency)).group_by(Scan.scan_type).all()
+    modality_latencies_query = db.query(Scan.scan_type, func.avg(Scan.inference_latency))
+    if tenant_id:
+        modality_latencies_query = modality_latencies_query.filter(Scan.tenant_id == tenant_id)
+    modality_latencies = modality_latencies_query.group_by(Scan.scan_type).all()
     modality_latency_map = {row[0]: round(float(row[1]), 2) if row[1] is not None else 0.0 for row in modality_latencies}
 
     # Pathology counts
-    pathology_counts = db.query(Scan.pathology_detected, func.count(Scan.id)).group_by(Scan.pathology_detected).all()
+    pathology_counts_query = db.query(Scan.pathology_detected, func.count(Scan.id))
+    if tenant_id:
+        pathology_counts_query = pathology_counts_query.filter(Scan.tenant_id == tenant_id)
+    pathology_counts = pathology_counts_query.group_by(Scan.pathology_detected).all()
     pathology_map = {row[0]: row[1] for row in pathology_counts}
 
     # Compute Positive rate (abnormals / eligible)
-    eligible_scans = db.query(func.count(Scan.id)).filter(Scan.pathology_detected != "Inconclusive").scalar() or 0
-    abnormal_count = db.query(func.count(Scan.id)).filter(
+    eligible_scans_query = db.query(func.count(Scan.id)).filter(Scan.pathology_detected != "Inconclusive")
+    if tenant_id:
+        eligible_scans_query = eligible_scans_query.filter(Scan.tenant_id == tenant_id)
+    eligible_scans = eligible_scans_query.scalar() or 0
+
+    abnormal_count_query = db.query(func.count(Scan.id)).filter(
         Scan.pathology_detected != "Normal",
         Scan.pathology_detected != "Inconclusive",
-    ).scalar() or 0
+    )
+    if tenant_id:
+        abnormal_count_query = abnormal_count_query.filter(Scan.tenant_id == tenant_id)
+    abnormal_count = abnormal_count_query.scalar() or 0
     positive_rate = round((abnormal_count / eligible_scans * 100), 1) if eligible_scans > 0 else 0.0
 
-    recent_scans = db.query(Scan).order_by(Scan.timestamp.desc()).limit(10).all()
+    recent_scans_query = db.query(Scan)
+    if tenant_id:
+        recent_scans_query = recent_scans_query.filter(Scan.tenant_id == tenant_id)
+    recent_scans = recent_scans_query.order_by(Scan.timestamp.desc()).limit(10).all()
+
     recent_list = [
         {
             "id": r.id,

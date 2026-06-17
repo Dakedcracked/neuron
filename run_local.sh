@@ -164,7 +164,7 @@ else:
 "
 echo "✓ Pre-flight diagnostics complete."
 
-# 7. Run database migrations to ensure priority column exists
+# 7. Run database migrations to ensure priority and tenant columns exist
 echo "🔄 Running database migrations..."
 python3 -c "
 import os
@@ -172,8 +172,36 @@ from sqlalchemy import text
 try:
     from app.database import engine
     with engine.begin() as conn:
-        conn.execute(text(\"ALTER TABLE scans ADD COLUMN IF NOT EXISTS priority VARCHAR DEFAULT 'normal';\"))
-    print('   ✓ Database migration successful (priority column verified).')
+        # Create clinic_tenants if not exists
+        conn.execute(text(\"\"\"
+        CREATE TABLE IF NOT EXISTS clinic_tenants (
+            id VARCHAR PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            created_at TIMESTAMP WITHOUT TIME ZONE
+        );
+        \"\"\"))
+        
+        # Add priority column to scans if not exists
+        try:
+            conn.execute(text(\"ALTER TABLE scans ADD COLUMN priority VARCHAR DEFAULT 'normal';\"))
+        except Exception:
+            pass
+            
+        # Add tenant_id column to scans if not exists
+        try:
+            conn.execute(text(\"ALTER TABLE scans ADD COLUMN tenant_id VARCHAR;\"))
+            conn.execute(text(\"ALTER TABLE scans ADD CONSTRAINT fk_scans_tenant FOREIGN KEY (tenant_id) REFERENCES clinic_tenants(id);\"))
+        except Exception:
+            pass
+            
+        # Add tenant_id column to users if not exists
+        try:
+            conn.execute(text(\"ALTER TABLE users ADD COLUMN tenant_id VARCHAR;\"))
+            conn.execute(text(\"ALTER TABLE users ADD CONSTRAINT fk_users_tenant FOREIGN KEY (tenant_id) REFERENCES clinic_tenants(id);\"))
+        except Exception:
+            pass
+            
+    print('   ✓ Database migrations successful (priority and tenant columns verified).')
 except Exception as e:
     print(f'   - ⚠ Database migration warning: {e}')
 "
