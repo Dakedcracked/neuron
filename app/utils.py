@@ -22,8 +22,31 @@ CLINIC_SALT = NEURON_CLINIC_SALT
 S3_BUCKET = S3_BUCKET_NAME
 
 
+def _is_s3_configured() -> bool:
+    """Returns True only when the S3/R2 endpoint URL is a real configured URL,
+    not the placeholder values from .env.example or a development environment."""
+    placeholder_tokens = ("account_id", "account-id", "mock_aws", "mock-aws")
+    if not S3_ENDPOINT_URL:
+        return False
+    url_lower = S3_ENDPOINT_URL.lower()
+    if any(tok in url_lower for tok in placeholder_tokens):
+        return False
+    key_lower = (AWS_ACCESS_KEY_ID or "").lower()
+    if "mock" in key_lower or not key_lower:
+        return False
+    return True
+
+
 def get_s3_client():
-    """Initializes and returns a boto3 S3 client configured for R2 object storage."""
+    """Initializes and returns a boto3 S3 client configured for R2 object storage.
+    Raises RuntimeError (instead of an obscure ValueError from boto3) when the
+    endpoint URL is not yet configured so callers can catch it gracefully.
+    """
+    if not _is_s3_configured():
+        raise RuntimeError(
+            "S3/R2 storage is not configured. Set AWS_ACCESS_KEY_ID, "
+            "AWS_SECRET_ACCESS_KEY, and a real S3_ENDPOINT_URL in .env."
+        )
     return boto3.client(
         's3',
         endpoint_url=S3_ENDPOINT_URL,
@@ -72,9 +95,13 @@ def upload_to_s3(file_content: bytes, filename: str) -> str:
 def generate_presigned_upload_url(filename: str, expiration=3600) -> dict:
     """
     Generates a secure presigned POST payload for direct browser-to-R2 uploads.
+    Returns an empty dict when R2 is not yet configured (dev / local mode).
     """
-    s3_client = get_s3_client()
+    if not _is_s3_configured():
+        print("⚠️ generate_presigned_upload_url: R2 not configured — returning empty response.")
+        return {}
     try:
+        s3_client = get_s3_client()
         response = s3_client.generate_presigned_post(
             Bucket=S3_BUCKET,
             Key=filename,
@@ -90,8 +117,16 @@ def ensure_bucket_lifecycle_policy():
     """
     Applies a strict 30-day lifecycle expiration policy to the S3/R2 bucket
     to guarantee DPDP storage compliance and minimize storage overhead costs.
+    Silently skips when R2 credentials are not yet configured (dev / local mode).
     """
-    s3_client = get_s3_client()
+    if not _is_s3_configured():
+        print("⚠️ ensure_bucket_lifecycle_policy: R2 not configured — skipping lifecycle setup.")
+        return
+    try:
+        s3_client = get_s3_client()
+    except RuntimeError as e:
+        print(f"⚠️ Warning: Could not create S3 client: {e}")
+        return
     lifecycle_policy = {
         'Rules': [
             {

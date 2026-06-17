@@ -34,8 +34,11 @@ async def lifespan(app: FastAPI):
     with AuthSession() as db:
         seed_default_admin(db)
     
-    from app.utils import ensure_bucket_lifecycle_policy
-    ensure_bucket_lifecycle_policy()
+    try:
+        from app.utils import ensure_bucket_lifecycle_policy
+        ensure_bucket_lifecycle_policy()
+    except Exception as _lc_err:
+        print(f"⚠️ Warning: Storage lifecycle setup skipped: {_lc_err}")
 
     print("✓ Neuron AI Clinical Platform ready.")
     yield
