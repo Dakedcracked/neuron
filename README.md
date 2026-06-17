@@ -42,6 +42,36 @@ Below is the directory mapping of the clinical platform:
 
 ---
 
+## 🏥 Clinical Decision Support System (CDSS) Upgrades
+
+We have upgraded the core computational logic of Neuron AI to transform it into a zero-fault, enterprise-grade CDSS. The key clinical components implemented are:
+
+### 1. RadImageNet Neural Network Foundation
+* **Targeted Models**: Core classifiers load weights pretrained on the **RadImageNet database** (comprising millions of real radiological scans across CT, MRI, and X-Ray) instead of generic natural image databases (ImageNet).
+* **Weight Loading Priority**: Models try loading `densenet121_radimagenet.pt` (for X-Rays) and `resnet50_radimagenet.pt` (for CT/MRI) first, before falling back to clinical weights (`densenet121_xrv.pt`/`resnet50_clinical.pt`) or perturbation fallback state dicts.
+
+### 2. 5-Fold Ensemble Voting Consensus
+* **Weighted Voting**: Both the FastAPI inference worker and standalone model serving server implement a 5-fold neural network ensemble for each modality.
+* **Aggregated Probabilities**: Individual fold probabilities are blended using a weighted soft-voting consensus matrix:
+  $$\text{Consensus Probability} = 0.25 \cdot P_{\text{fold}_1} + 0.20 \cdot P_{\text{fold}_2} + 0.20 \cdot P_{\text{fold}_3} + 0.20 \cdot P_{\text{fold}_4} + 0.15 \cdot P_{\text{fold}_5}$$
+
+### 3. Clinical Variance Triage Override
+* **Variance Threshold**: The system computes the class-wise standard deviation ($\sigma$) across the 5 fold predictions. 
+* **Triage Safeguard**: If any pathology shows a fold standard deviation **$\sigma > 0.15$**, a clinical conflict is declared. 
+* **Safety Return**: The final pathology is overridden to **`"Inconclusive (Discrepancy Triage)"`** and the confidence score is set to `0.0`, ensuring that ambiguous or conflicting predictions are never forced.
+
+### 4. Triage Queue Routing & Priority Elevation
+* **Triage Status**: The `scans` table contains a dedicated `priority` column (`normal`, `high`, `critical`).
+* **Auto-escalation**: When a Celery worker processes a scan and receives a triage override (`Inconclusive (Discrepancy Triage)`), it automatically sets the scan's database priority to `high` and changes its status to `"triage"`.
+* **Radiologist Queue**: This elevates and pins the scan to the top of the radiologist review queue, highlighting it in red for priority verification.
+
+### 5. Dynamic Grad-CAM Localizations & Connected Components
+* **Dynamic Bboxes**: All hardcoded bounding box coordinate dictionaries have been deleted. Bounding boxes are computed dynamically from pixel-level activations.
+* **Grad-CAM Hotspots**: Running a backward pass on the winning pathology class generates a 2D activation heatmap.
+* **Connected Component Labeling**: The backend applies a threshold to the heatmap and runs connected component analysis (using `scipy.ndimage` / `cv2` contour detection) to extract the bounding box coordinates enclosing the high-activation lesion zones.
+
+---
+
 ## 🔄 How Scans & Queries Flow (End-to-End)
 
 When a radiologist uploads a scan and views the diagnostic results, the system processes it through a decoupled, asynchronous pipeline:
@@ -130,9 +160,10 @@ chmod +x run_local.sh
 
 The bootstrap script will automatically:
 1. Initialize the Python virtual environment and install dependencies.
-2. Spin up the background **Celery worker** (logging to `celery.log`).
-3. Spin up the standalone **Model Server** on Port 8001 (logging to `model_server.log`).
-4. Start the **FastAPI Web Workstation** on Port 8000.
+2. Run database migrations to ensure the `priority` column is present in the `scans` table.
+3. Spin up the background **Celery worker** (logging to `celery.log`).
+4. Spin up the standalone **Model Server** on Port 8001 (logging to `model_server.log`).
+5. Start the **FastAPI Web Workstation** on Port 8000.
 
 Open **http://127.0.0.1:8000** in your browser.
 * **Username**: `admin`

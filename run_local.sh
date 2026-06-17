@@ -164,7 +164,21 @@ else:
 "
 echo "✓ Pre-flight diagnostics complete."
 
-# 7. Start Celery worker in the background
+# 7. Run database migrations to ensure priority column exists
+echo "🔄 Running database migrations..."
+python3 -c "
+import os
+from sqlalchemy import text
+try:
+    from app.database import engine
+    with engine.begin() as conn:
+        conn.execute(text(\"ALTER TABLE scans ADD COLUMN IF NOT EXISTS priority VARCHAR DEFAULT 'normal';\"))
+    print('   ✓ Database migration successful (priority column verified).')
+except Exception as e:
+    print(f'   - ⚠ Database migration warning: {e}')
+"
+
+# 8. Start Celery worker in the background
 echo "🐝 Starting Celery background worker..."
 celery -A app.worker.celery_app worker --loglevel=info --pool=solo > celery.log 2>&1 &
 CELERY_PID=$!
