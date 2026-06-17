@@ -70,6 +70,18 @@ We have upgraded the core computational logic of Neuron AI to transform it into 
 * **Grad-CAM Hotspots**: Running a backward pass on the winning pathology class generates a 2D activation heatmap.
 * **Connected Component Labeling**: The backend applies a threshold to the heatmap and runs connected component analysis (using `scipy.ndimage` / `cv2` contour detection) to extract the bounding box coordinates enclosing the high-activation lesion zones.
 
+### 6. B2B SaaS Multi-Tenancy & Row-Level Data Isolation
+* **Clinic Tenancy Schema**: Implements a strict tenant partitioning system based on a `clinic_tenants` table. Users and scans are bound to a specific `tenant_id`.
+* **Access Scope Enforcement**: All data fetching queries (metrics, history, scan status) are scoped by `current_user.tenant_id`, completely preventing cross-tenant leakage.
+
+### 7. Pre-Inference Safety Rails Validation
+* **Scan Ingestion Security**: Intercepts uploaded files at the API gateway layer, checking format structures, header offsets, magic bytes (like `DICM`), and voxel size constraints for DICOM and NIfTI.
+* **Proactive Rejection**: Malformed, incomplete, or corrupted files raise a `SafetyRailException` and return `400 Bad Request` instantly before they ever reach the GPU models.
+
+### 8. Queue Partitioning & RabbitMQ Task Routing
+* **Reliable Messaging**: Replaces Redis task distribution with RabbitMQ broker configuration and dynamic queue routing.
+* **Task Queues**: Implements two distinct task queues: `scans.triage` (for `high` or `critical` priority uploads) and `scans.standard` (for normal priority).
+
 ---
 
 ## 🔄 How Scans & Queries Flow (End-to-End)

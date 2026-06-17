@@ -53,12 +53,12 @@ if [ ! -f .env ]; then
 import os
 with open('.env', 'r') as f:
     content = f.read()
-content = content.replace('NEURON_SECRET_KEY=', 'NEURON_SECRET_KEY=' + os.environ['RAND_JWT_KEY'])
+content = content.replace('JWT_SECRET=', 'JWT_SECRET=' + os.environ['RAND_JWT_KEY'])
 content = content.replace('NEURON_CLINIC_SALT=', 'NEURON_CLINIC_SALT=' + os.environ['RAND_SALT'])
 with open('.env', 'w') as f:
     f.write(content)
 "
-    echo "✓ Generated secure random NEURON_SECRET_KEY and NEURON_CLINIC_SALT in .env."
+    echo "✓ Generated secure random JWT_SECRET and NEURON_CLINIC_SALT in .env."
     # Clean up temporary export variables
     unset RAND_JWT_KEY
     unset RAND_SALT
