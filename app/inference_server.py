@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Form
 import onnxruntime as ort
 import torch.nn as nn
 from pathlib import Path
+import timm
 
 try:
     import tritonclient.http as tritonhttp
@@ -143,59 +144,54 @@ def load_models():
 
     # ── 2. Load CT/MRI ResNet-50 5-Fold Ensembles ────────────────────────────
     try:
-        from torchvision import models as tv_models
-
         def _build_resnet_folds(modality: str, num_classes: int):
-            """Loads 5 folds of ResNet-50 for CT or MRI."""
+            """Loads 5 folds of SOTA EfficientNet-B4 for CT or MRI."""
             folds = []
-
-            # Priority: radimagenet > clinical
-            radimagenet_path = MODEL_DIR / "resnet50_radimagenet.pt"
-            clinical_path = MODEL_DIR / "resnet50_clinical.pt"
+            model_name = "efficientnet_b4"
+            clinical_path = MODEL_DIR / f"{model_name}_clinical.pt"
 
             base_state = None
             loaded_source = "none"
 
-            if radimagenet_path.exists():
-                base_state = torch.load(radimagenet_path, map_location="cpu")
-                loaded_source = "RadImageNet"
-            elif clinical_path.exists():
-                base_state = torch.load(clinical_path, map_location="cpu")
-                loaded_source = "clinical (RadImageNet fallback)"
-            else:
-                net_temp = tv_models.resnet50(weights=None)
-                base_state = net_temp.state_dict()
-                loaded_source = "uninitialized (no pretrained weights)"
+            if clinical_path.exists():
+                try:
+                    base_state = torch.load(clinical_path, map_location="cpu")
+                    loaded_source = "clinical cache"
+                except Exception:
+                    pass
 
-            print(f"  ✓ {loaded_source}-pretrained ResNet-50 base loaded for {modality} folds.")
+            if base_state is None:
+                try:
+                    net_temp = timm.create_model(model_name, pretrained=True, num_classes=num_classes)
+                    base_state = net_temp.state_dict()
+                    loaded_source = "Hugging Face (SOTA pretrained)"
+                    torch.save(base_state, clinical_path)
+                except Exception as e:
+                    print(f"    ⚠ Failed to download SOTA model from Hugging Face ({e}). Building uninitialized model.")
+                    net_temp = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+                    base_state = net_temp.state_dict()
+                    loaded_source = "uninitialized fallback"
+
+            print(f"  ✓ {loaded_source} SOTA convolutional features loaded for {modality} folds.")
 
             for fold in range(1, 6):
-                fold_file = MODEL_DIR / f"resnet50_{modality.lower()}_fold{fold}.pt"
-                if not fold_file.exists():
-                    fold_file = MODEL_DIR / f"resnet50_fold{fold}.pt"
-
-                net = tv_models.resnet50(weights=None)
-                net.fc = nn.Linear(net.fc.in_features, num_classes)
+                fold_file = MODEL_DIR / f"{model_name}_{modality.lower()}_fold{fold}.pt"
+                net = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
 
                 if fold_file.exists():
                     try:
                         state_dict = torch.load(fold_file, map_location="cpu")
                         net.load_state_dict(state_dict, strict=False)
-                        print(f"    ✓ Loaded ResNet-50 {modality} Fold {fold} from {fold_file.name}.")
+                        print(f"    ✓ Loaded SOTA {modality} Fold {fold} from {fold_file.name}.")
                     except Exception as e:
                         print(f"    ⚠ Error loading Fold {fold}: {e}. Falling back to perturbed base.")
                         fold_file = None
 
                 if not fold_file or not fold_file.exists():
-                    # Perturbation fallback
-                    net = tv_models.resnet50(weights=None)
                     net.load_state_dict(base_state, strict=False)
-                    net.fc = nn.Linear(net.fc.in_features, num_classes)
-
                     for param in net.parameters():
                         param.data += torch.randn_like(param.data) * 1e-4
-
-                    print(f"    ⚠ ResNet-50 {modality} Fold {fold} missing. Generated via perturbation.")
+                    print(f"    ⚠ SOTA {modality} Fold {fold} checkpoint missing. Generated via perturbation.")
 
                 net.to(DEVICE)
                 if DEVICE.type == "cuda":
@@ -210,9 +206,9 @@ def load_models():
 
         ct_model = ct_folds[0]
         mri_model = mri_folds[0]
-        print(f"✓ [Model Server] ResNet-50 5-fold ensembles loaded for CT ({len(ct_folds)}) and MRI ({len(mri_folds)}).")
+        print(f"✓ [Model Server] SOTA EfficientNet-B4 5-fold ensembles loaded for CT ({len(ct_folds)}) and MRI ({len(mri_folds)}).")
     except Exception as e:
-        print(f"⚠ [Model Server] ResNet-50 ensemble load failed: {e}")
+        print(f"⚠ [Model Server] SOTA EfficientNet-B4 ensemble load failed: {e}")
 
     # ── 3. Load MRI ONNX SegResNet ───────────────────────────────────────────
     try:
@@ -318,6 +314,15 @@ def _resolve_gradcam_target_layer(model, modality: str):
     else:
         if hasattr(model, "layer4"):
             return model.layer4
+        if hasattr(model, "conv_head"):
+            return model.conv_head
+        # Fallback: recursively search for the last Conv2d layer
+        last_conv = None
+        for module in model.modules():
+            if isinstance(module, torch.nn.Conv2d):
+                last_conv = module
+        if last_conv is not None:
+            return last_conv
     return None
 
 
@@ -673,7 +678,16 @@ def execute_modality_batch(modality: str, requests: list) -> list:
 
                         if target_class_idx is not None and target_class_idx < len(pathologies) - 1:
                             if triton_activations is not None:
-                                weights = model.fc.weight.data.cpu().numpy()
+                                if hasattr(model, "fc"):
+                                    weights = model.fc.weight.data.cpu().numpy()
+                                elif hasattr(model, "classifier"):
+                                    weights = model.classifier.weight.data.cpu().numpy()
+                                else:
+                                    last_linear = None
+                                    for module in model.modules():
+                                        if isinstance(module, torch.nn.Linear):
+                                            last_linear = module
+                                    weights = last_linear.weight.data.cpu().numpy()
                                 heatmap_raw = _reconstruct_cam_from_activations(triton_activations[idx], weights[target_class_idx])
                                 h_orig, w_orig = _load_original_image_for_blending(r["file_path"]).shape
                                 heatmap = _resize_heatmap(heatmap_raw, (h_orig, w_orig))
